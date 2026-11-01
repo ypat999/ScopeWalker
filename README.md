@@ -33,10 +33,13 @@ The selection frame stays on top of every other window, so you can keep working 
 - **RGB Parade** — the classic three-panel view.
 - **RGB Histogram** — smoothed, with Lightroom-style curves per channel.
 - **Clipping indicator** — pure white shows as a red bar on top, pure black as a blue bar at the bottom.
+- **Background bars ignored** — letterbox / pillarbox bands (the flat black, grey or white strips a viewer adds around an image of a different aspect ratio) are detected and left out of the statistics instead of skewing them.
 - **RGB at cursor** — live readout of the pixel under your mouse.
 - **Live tracking** — the scopes refresh automatically, but only when something actually changes in the selected area (so it stays light on CPU).
 - **Split scopes** — pop each scope into its own window and arrange your workspace however you like.
 - **Customizable** — change the modifier key, the pause key, the frame color, and the brightness of the point cloud.
+- **Two languages** — the whole interface switches between English and 中文 in **Preferences → Language**, fonts and all.
+- **Everything in one file** — every setting, plus the position and size of every window, is saved in `scopewalker.ini` next to the executable.
 
 ---
 
@@ -53,6 +56,21 @@ The modifier and pause keys can be changed in **Preferences**.
 
 ---
 
+## Settings file
+
+Everything is stored in `scopewalker.ini`, created next to the executable on first run and rewritten whenever a setting or a window moves. It is plain text, so it can be edited by hand or copied to another machine.
+
+| Section | Contents |
+|---|---|
+| `[prefs]` | `lang` (0 = English, 1 = 中文), `mod` and `pause` (virtual key codes), `framecolor` (RRGGBB hex), `skin`, `rgbatcursor`, `clipping`, `ignorebars`, `hdrnorm`, `wfrgb`, `split`, `zoom2`, `brightness` |
+| `[window]` | `main_x`, `main_y`, `main_w`, `main_h` — the main window's position and size |
+| `[scopes]` | per scope: `<name>_on`, `<name>_prop` (the width you set by dragging the separator) |
+| `[detached]` | per split-off window: `<name>_x`, `<name>_y`, `<name>_w`, `<name>_h` |
+
+Names are `wave`, `par`, `hist` (the vectorscope is always on). A saved window position that no longer matches any connected monitor is ignored, so unplugging a screen never leaves a window unreachable.
+
+---
+
 ## Requirements
 
 Windows 10 or 11 (64-bit). Nothing else — it's a single standalone `.exe` written in plain C with the Win32 API.
@@ -61,12 +79,12 @@ Windows 10 or 11 (64-bit). Nothing else — it's a single standalone `.exe` writ
 
 ## Build from source
 
-The whole app is a single C file ([`src/scopewalker.c`](src/scopewalker.c)) using only the Win32 API. It links against `gdi32`, `user32`, `dwmapi` and `advapi32` — no third-party dependencies.
+The whole app is a single C file ([`src/scopewalker.c`](src/scopewalker.c)) using only the Win32 API. It links against `gdi32`, `user32`, `dwmapi`, `advapi32`, plus `runtimeobject`, `d3d11` and `dxgi` for the HDR capture path — all part of Windows, no third-party dependencies.
 
 ### MSVC (Developer Command Prompt)
 
 ```bat
-cl /O2 src\scopewalker.c /link gdi32.lib user32.lib dwmapi.lib advapi32.lib /subsystem:windows /out:scopewalker.exe
+cl /O2 /utf-8 src\scopewalker.c /link gdi32.lib user32.lib dwmapi.lib advapi32.lib runtimeobject.lib d3d11.lib dxgi.lib ole32.lib /subsystem:windows /out:scopewalker.exe
 ```
 
 Verified with the Visual Studio 2019 Build Tools (x64).
@@ -74,7 +92,7 @@ Verified with the Visual Studio 2019 Build Tools (x64).
 ### MinGW-w64 (GCC)
 
 ```sh
-gcc -O2 -mwindows src/scopewalker.c -o scopewalker.exe -lgdi32 -luser32 -ldwmapi -ladvapi32
+gcc -O2 -mwindows src/scopewalker.c -o scopewalker.exe -lgdi32 -luser32 -ldwmapi -ladvapi32 -lruntimeobject -ld3d11 -ldxgi -lole32
 ```
 
 > `-mwindows` builds a GUI app (no console window). Drop it if you want a console for debugging.

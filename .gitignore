@@ -11,6 +11,9 @@
 *.res
 *.map
 
+# User settings written next to the exe
+scopewalker.ini
+
 # Build directories
 build/
 out/

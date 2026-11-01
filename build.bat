@@ -39,8 +39,9 @@ call "%VCVARS%" >nul
 
 echo.
 echo === Compiling scopewalker.exe ===
-cl /nologo /O2 /W3 src\scopewalker.c ^
+cl /nologo /O2 /W3 /utf-8 src\scopewalker.c ^
    /link gdi32.lib user32.lib dwmapi.lib advapi32.lib ^
+         runtimeobject.lib d3d11.lib dxgi.lib ole32.lib ^
    /subsystem:windows /out:scopewalker.exe
 
 if errorlevel 1 goto :fail

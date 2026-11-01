@@ -7,21 +7,80 @@
 // a la ligne suivante. Ils peuvent aussi etre detaches ("Split scopes").
 
 #define WIN32_LEAN_AND_MEAN
+#include <initguid.h>
 #include <windows.h>
 #include <dwmapi.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
-#define MIN_CANVAS   180
-#define MAX_CANVAS   1200
-#define MARGIN       14
-#define MENUBAR_H    32
-#define STATUS_H     26
-#define SPLIT_W      8
+/* ---- Windows.Graphics.Capture : seul chemin qui rende le HDR intact ----
+   BitBlt et la duplication DXGI s'arretent a 8 bits et recuperent le desktop
+   APRES la compression HDR->SDR de Windows : tout ce qui depasse le blanc SDR
+   tombe a 255 et devient irreparable. WGC rend une texture FP16 en lumiere
+   LINEAIRE (verifie : le rapport mesure est constant a 3,5000 sur toute une
+   rampe de gris), donc avec de la marge au-dessus du blanc.
+   Ces en-tetes exigent COBJMACROS + les macros WIDL_using_* pour que les noms
+   courts existent en C. Seul le C de MinGW les fournit : les en-tetes du SDK
+   Microsoft ne les exposent qu'en C++, donc sous MSVC cette voie est compilee
+   vide et BitBlt prend le relais. */
+#if defined(__GNUC__)
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
+#define WIDL_using_Windows_Foundation
+#define WIDL_using_Windows_Graphics
+#define WIDL_using_Windows_Graphics_DirectX
+#define WIDL_using_Windows_Graphics_DirectX_Direct3D11
+#define WIDL_using_Windows_Graphics_Capture
+#include <roapi.h>
+#include <winstring.h>
+#include <inspectable.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <windows.foundation.h>
+#include <windows.graphics.h>
+#include <windows.graphics.directx.h>
+#include <windows.graphics.directx.direct3d11.h>
+#include <windows.graphics.capture.h>
+#include <windows.graphics.capture.interop.h>
+
+/* Les deux que l'en-tete interop de MinGW ne fournit pas. En C, la structure
+   IDirect3DDxgiInterfaceAccess n'est declaree nulle part : a faire ici. */
+struct IDirect3DDxgiInterfaceAccess;
+typedef struct IDirect3DDxgiInterfaceAccessVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct IDirect3DDxgiInterfaceAccess*,REFIID,void**);
+    ULONG (STDMETHODCALLTYPE *AddRef)(struct IDirect3DDxgiInterfaceAccess*);
+    ULONG (STDMETHODCALLTYPE *Release)(struct IDirect3DDxgiInterfaceAccess*);
+    HRESULT (STDMETHODCALLTYPE *GetInterface)(struct IDirect3DDxgiInterfaceAccess*,REFIID,void**);
+} IDirect3DDxgiInterfaceAccessVtbl;
+
+typedef struct IDirect3DDxgiInterfaceAccess {
+    CONST_VTBL IDirect3DDxgiInterfaceAccessVtbl *lpVtbl;
+} IDirect3DDxgiInterfaceAccess;
+
+static const GUID IID_DxgiAccess =
+    {0xa9b3d012,0x3df2,0x4ee3,{0xb8,0xd1,0x86,0x95,0xf4,0x57,0xd3,0xc1}};
+
+extern HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(IDXGIDevice*,IInspectable**);
+#endif /* __GNUC__ : en-tetes WinRT */
+
+/* Echelle de l'interface en % (100 = 96 dpi / 100%), genree dans WinMain une
+   fois le process rendu "DPI aware". Toutes les dimensions ci-dessous sont
+   exprimees en pixels "a 100%" et converties a l'usage. */
+static int g_uiScale=100;
+#define UI(px)  ( ((px)*g_uiScale + 50) / 100 )
+
+#define MIN_CANVAS   UI(180)
+#define MAX_CANVAS   UI(1200)
+#define MARGIN       UI(14)
+#define MENUBAR_H    UI(32)
+#define STATUS_H     UI(26)
+#define SPLIT_W      UI(8)
 #define MAX_SAMPLES  90000
-#define RESIZE_EDGE  6
+#define RESIZE_EDGE  UI(6)
 
 #define UI_BG_R 32
 #define UI_BG_G 32
@@ -39,6 +98,121 @@ static const char *OVERLAY_CLASS="SWOverlayWnd";
 static const char *PREFS_CLASS  ="SWPrefsWnd";
 static const char *SCOPES_CLASS ="SWScopesWnd";
 static const char *SCOPEW_CLASS ="SWScopeWnd";
+
+/* ================= langues =================
+   Tout le texte passe par Tr(id). Les chaines sont en UTF-16 et rendues avec
+   les API W : le francais passait par des TextOutA et des longueurs codees en
+   dur, ce qui ne peut pas porter les ideogrammes. Les positions qui dependent
+   de la largeur d'un texte sont MESUREES (DrawTxtW / TextW), plus estimees. */
+enum { L_EN=0, L_ZH=1 };
+enum {
+  S_ON,S_OFF,S_SCOPES,S_PREFS,S_RESET,
+  S_HINT,S_PAUSED,S_RESETZONE,S_TOOSMALL,S_ZONEBORDS,S_ZONEACTIVE,
+  S_HDRSTRETCH,S_HDRWHITE,S_HDRGAIN,S_HDRSAT,S_HDR,
+  S_ZOOM2,S_RGBAT,S_PCT100,S_SKIN,S_WAVEFORM,S_PARADE,S_RGB,S_255,
+  S_HSEL,S_HPAUSE,S_HWAVE,S_HCOLOR,S_HBRIGHT,
+  S_ALT,S_CTRL,S_SHIFT,S_WIN,S_ESC,
+  S_LUMA,S_PARADEM,
+  S_CKSKIN,S_CKRGB,S_CKCLIP,S_CKBARS,S_CKHDR,
+  S_VEC,S_WAVE,S_PAR,S_HIST,S_SPLIT,
+  S_HLANG,S_EN_LBL,S_ZH_LBL,S_COUNT_STR
+};
+
+/* Une ligne par identifiant, { anglais, chinois }. L'ordre suit l'enum au
+   element pres : un decalage d'une ligne decalerait toute l'interface. */
+static const wchar_t*STR[S_COUNT_STR][2]={
+  {L"ON",                 L"开"},                       /* S_ON */
+  {L"OFF",                L"关"},                        /* S_OFF */
+  {L"Scopes",             L"示波器"},                    /* S_SCOPES */
+  {L"Preferences",        L"首选项"},                    /* S_PREFS */
+  {L"Reset",              L"重置"},                      /* S_RESET */
+
+  {L"Hold Alt, then left-drag to pick an area.",
+                          L"按住 Alt 并左键拖拽，框选要分析的区域。"},   /* S_HINT */
+  {L"Tracking paused - press ON to resume.",
+                          L"跟踪已暂停 - 点“开”恢复。"},                /* S_PAUSED */
+  {L"Area cleared. Alt + left-drag to pick a new one.",
+                          L"区域已清除。按住 Alt 左键拖拽可重新框选。"},  /* S_RESETZONE */
+  {L"Selection too small - try again.",
+                          L"框选太小 - 请重试。"},                       /* S_TOOSMALL */
+  {L"Area : %d x %d px  -  edges skipped  t:%d b:%d l:%d r:%d%s",
+                          L"区域：%d x %d 像素 - 已跳过边缘 上:%d 下:%d 左:%d 右:%d%s"}, /* S_ZONEBORDS */
+  {L"Area : %d x %d px  -  tracking%s",
+                          L"区域：%d x %d 像素 - 跟踪中%s"},             /* S_ZONEACTIVE */
+
+  {L"  -  HDR x%.2f (white %.2f)",  L"  -  HDR x%.2f（白点 %.2f）"},     /* S_HDRSTRETCH */
+  {L"  -  HDR (white %.2f)",        L"  -  HDR（白点 %.2f）"},           /* S_HDRWHITE */
+  {L"  -  HDR x%.2f",               L"  -  HDR x%.2f"},                  /* S_HDRGAIN */
+  {L"  -  HDR %d%% at 255",         L"  -  HDR %d%% 顶到 255"},          /* S_HDRSAT */
+  {L"  -  HDR",                     L"  -  HDR"},                        /* S_HDR */
+
+  {L"Zoom x2",              L"2 倍缩放"},                 /* S_ZOOM2 */
+  {L"R:%d, G:%d, B:%d",     L"R:%d, G:%d, B:%d"},         /* S_RGBAT */
+  {L"100%",                 L"100%"},                     /* S_PCT100 */
+  {L"skin",                 L"肤色"},                     /* S_SKIN */
+  {L"waveform",             L"波形"},                     /* S_WAVEFORM */
+  {L"parade",               L"三色"},                     /* S_PARADE */
+  {L"RGB",                  L"RGB"},                      /* S_RGB */
+  {L"255",                  L"255"},                      /* S_255 */
+
+  {L"Selection (hold + drag)",  L"框选（按住 + 拖拽）"},   /* S_HSEL */
+  {L"Pause / resume key",       L"暂停 / 恢复按键"},       /* S_HPAUSE */
+  {L"Waveform mode",            L"波形模式"},              /* S_HWAVE */
+  {L"Frame colour",             L"边框颜色"},              /* S_HCOLOR */
+  {L"Cloud brightness : %.2fx", L"点云亮度：%.2fx"},       /* S_HBRIGHT */
+
+  {L"Alt",   L"Alt"},      /* S_ALT */
+  {L"Ctrl",  L"Ctrl"},     /* S_CTRL */
+  {L"Shift", L"Shift"},    /* S_SHIFT */
+  {L"Win",   L"Win"},      /* S_WIN */
+  {L"Esc",   L"Esc"},      /* S_ESC */
+
+  {L"White (luma)",   L"亮度（黑白）"},     /* S_LUMA */
+  {L"RGB (parade)",   L"RGB（三色）"},      /* S_PARADEM */
+
+  {L"Show skin tone line",       L"显示肤色线"},            /* S_CKSKIN */
+  {L"RGB at cursor",             L"光标处 RGB"},            /* S_CKRGB */
+  {L"Clipping",                  L"溢出提示"},              /* S_CKCLIP */
+  {L"Ignore background bars",    L"忽略背景色带"},          /* S_CKBARS */
+  {L"Calibrate levels under HDR",L"HDR 下自动校准电平"},    /* S_CKHDR */
+
+  {L"Vectorscope",    L"矢量示波器"},        /* S_VEC */
+  {L"Waveform",       L"波形示波器"},        /* S_WAVE */
+  {L"Parade",         L"三色示波器"},        /* S_PAR */
+  {L"RGB Histogram",  L"RGB 直方图"},        /* S_HIST */
+  {L"Split scopes",   L"拆分示波器"},        /* S_SPLIT */
+
+  {L"Language",  L"语言"},                   /* S_HLANG */
+  {L"English",   L"English"},                /* S_EN_LBL */
+  {L"中文",      L"中文"}                     /* S_ZH_LBL */
+};
+
+static int g_lang=L_EN;
+
+/* Garde-fou : si une ligne manque ou en est de trop dans STR[], l'ordre
+   n'est plus celui de l'enum et toute l'interface se decale. Ca doit casser a
+   la compilation, pas a l'execution. */
+typedef char STR_TABLE_SIZE_CHECK[
+    (sizeof(STR)/sizeof(STR[0])) == S_COUNT_STR ? 1 : -1 ];
+static const wchar_t*Tr(int id){
+    const wchar_t*s=STR[id][g_lang];
+    return s?s:STR[id][0];
+}
+
+/* Dessine du texte en W et renvoie sa taille : c'est la seule facon de placer
+   correctement les libelles qui changent de largeur d'une langue a l'autre. */
+static SIZE DrawTxtW(HDC dc,int x,int y,const wchar_t*s){
+    SIZE sz; sz.cx=0; sz.cy=0;
+    if(!s||!*s) return sz;
+    GetTextExtentPoint32W(dc,s,(int)wcslen(s),&sz);
+    TextOutW(dc,x,y,s,(int)wcslen(s));
+    return sz;
+}
+static int WideW(HDC dc,const wchar_t*s){
+    SIZE sz; if(!s||!*s) return 0;
+    if(!GetTextExtentPoint32W(dc,s,(int)wcslen(s),&sz)) return 0;
+    return sz.cx;
+}
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -60,10 +234,13 @@ typedef struct {
     HWND    wnd;
     BOOL    on;
     double  prop;
+    RECT    wr;        /* cadre de la fenetre detachee, meme apres sa fermeture */
+    BOOL    wrValid;
 } Scope;
 
 static Scope g_sc[SC_COUNT];
-static const char *SC_NAME[SC_COUNT]={"Vectorscope","Waveform","Parade","Histogramme RGB"};
+/* noms affiches : un identifiant de chaine par scope, plus de texte en dur */
+static const int SC_STR[SC_COUNT]={S_VEC,S_WAVE,S_PAR,S_HIST};
 
 static HWND  g_hMain=NULL,g_hOverlay=NULL,g_hPrefs=NULL,g_hScopes=NULL;
 static POINT g_overlayOrigin={0,0};
@@ -76,7 +253,7 @@ static RECT  g_selRectScreen={0,0,0,0};
 
 static HFONT g_hFont=NULL,g_hFontBold=NULL;
 
-static char g_status[256]="ALT + clic gauche, puis glissez pour choisir une zone.";
+static wchar_t g_status[256];
 static BOOL g_hasSelection=FALSE,g_paused=FALSE;
 static int  g_refreshCounter=0,g_topmostCounter=0,g_cursorCounter=0;
 #define REFRESH_TICKS 6
@@ -89,6 +266,8 @@ static COLORREF g_frameColor=RGB(255,255,255);
 static BOOL     g_showSkin=TRUE;
 static BOOL     g_rgbAtCursor=TRUE;
 static BOOL     g_clipping=TRUE;
+static BOOL     g_ignoreBars=TRUE;   /* exclure les bandes de fond (letterbox) */
+static BOOL     g_hdrNorm=TRUE;      /* recalibrer l'echelle quand la sortie est HDR */
 static BOOL     g_wfRGB=FALSE;
 static BOOL     g_split=FALSE;
 static BYTE     g_curR=0,g_curG=0,g_curB=0;
@@ -120,12 +299,201 @@ static COLORREF g_swatch[6]={
     RGB(255,210,60),RGB(80,200,255),RGB(255,90,220)
 };
 static RECT g_swatchRc[6],g_modRc[4],g_pauseRc[3],g_wfModeRc[2];
-static RECT g_skinRc,g_rgbCurRc,g_clipRc,g_sliderRc;
+static RECT g_skinRc,g_rgbCurRc,g_clipRc,g_barsRc,g_hdrRc,g_sliderRc,g_langRc[2];
 static BOOL g_sliderDrag=FALSE;
 static RECT g_scChkRc[SC_COUNT],g_scSplitRc;
 
 static HDC     g_pfDC=NULL;   static HBITMAP g_pfBmp=NULL;
 static DWORD  *g_pfBits=NULL; static int g_pfW=0,g_pfH=0;
+
+/* ================= reglages : scopewalker.ini =================
+   TOUS les reglages sont persistes a cote de l'executable : langue, touches,
+   couleur du cadre, options, eclatement des scopes, proportions de chaque
+   colonne et cadre de chaque fenetre (principale + detachees). Quatre sections :
+     [prefs] [window] [scopes] [detached]
+   Tout est ecrit en ASCII (la langue est un numero), donc le fichier se lit et
+   se modifie a la main sans outillage. Les valeurs absentes laissent la valeur
+   par defaut du programme. */
+static char g_iniPath[MAX_PATH]="scopewalker.ini";
+
+static const char *SC_KEY[SC_COUNT]={"vec","wave","par","hist"};
+#define OFFSCREEN (-32000)
+
+/* Un cadre enregistre sur un ecran depuis debranche designerait du vide :
+   MONITOR_DEFAULTTONULL repond NULL des qu'aucun moniteur ne touche le rect. */
+static BOOL RectOnScreen(const RECT*r)
+{ return MonitorFromRect(r,MONITOR_DEFAULTTONULL)!=NULL; }
+
+static void IniInit(void)
+{
+    static const char leaf[]="\\scopewalker.ini";
+    char dir[MAX_PATH];
+    DWORD n=GetModuleFileNameA(NULL,dir,(DWORD)sizeof(dir));
+    if(n==0||n>=sizeof(dir)) return;
+    char*s=strrchr(dir,'\\');
+    if(!s) s=strrchr(dir,'/');
+    if(!s) return;
+    *s=0;
+    size_t dl=strlen(dir), ll=sizeof(leaf)-1;
+    /* longueur verifiee avant copie : pas de troncature silencieuse du chemin */
+    if(dl+ll<sizeof(g_iniPath)){
+        memcpy(g_iniPath,dir,dl);
+        memcpy(g_iniPath+dl,leaf,ll+1);
+    }
+}
+
+static int IniGetInt(const char*sec,const char*key,int def)
+{ return GetPrivateProfileIntA(sec,key,def,g_iniPath); }
+
+static double IniGetDbl(const char*sec,const char*key,double def)
+{
+    char b[64];
+    if(GetPrivateProfileStringA(sec,key,"",b,(DWORD)sizeof(b),g_iniPath)==0) return def;
+    char*e=NULL; double v=strtod(b,&e);
+    return (e==b)?def:v;
+}
+
+static BOOL IniGetBool(const char*sec,const char*key,BOOL def)
+{
+    char b[32];
+    if(GetPrivateProfileStringA(sec,key,"",b,(DWORD)sizeof(b),g_iniPath)==0||!b[0]) return def;
+    switch(b[0]){
+    case '1': case 'y': case 'Y': case 't': case 'T': return TRUE;
+    case '0': case 'n': case 'N': case 'f': case 'F': return FALSE;
+    default: return def;
+    }
+}
+
+static void IniPutInt(const char*sec,const char*key,int v)
+{ char b[32]; snprintf(b,sizeof(b),"%d",v); WritePrivateProfileStringA(sec,key,b,g_iniPath); }
+
+static void IniPutBool(const char*sec,const char*key,BOOL v)
+{ IniPutInt(sec,key,v?1:0); }
+
+static void IniPutDbl(const char*sec,const char*key,double v)
+{ char b[32]; snprintf(b,sizeof(b),"%.4f",v); WritePrivateProfileStringA(sec,key,b,g_iniPath); }
+
+/* Couleur ecrite en RRGGBB : c'est le seul reglage qu'on edite a l'oeil, et le
+   COLORREF de Windows est en BBGGRR, donc on retourne les octets en entree et
+   en sortie pour que le fichier reste lisible. */
+static void IniPutColor(const char*sec,const char*key,COLORREF c)
+{
+    char b[16];
+    snprintf(b,sizeof(b),"%06X",
+        (unsigned)(((DWORD)GetRValue(c)<<16)|((DWORD)GetGValue(c)<<8)|GetBValue(c)));
+    WritePrivateProfileStringA(sec,key,b,g_iniPath);
+}
+static COLORREF IniGetColor(const char*sec,const char*key,COLORREF def)
+{
+    char b[16];
+    if(GetPrivateProfileStringA(sec,key,"",b,(DWORD)sizeof(b),g_iniPath)==0||!b[0]) return def;
+    char*e=NULL; long v=strtol(b,&e,16);
+    if(e==b) return def;
+    return RGB((BYTE)((v>>16)&0xFF),(BYTE)((v>>8)&0xFF),(BYTE)(v&0xFF));
+}
+
+/* un cadre = 4 cles <key>_x/_y/_w/_h ; _ok dit si la section etait renseignee */
+static void IniGetRect(const char*sec,const char*key,RECT*r,BOOL*ok)
+{
+    char k[40];
+    snprintf(k,sizeof(k),"%s_x",key); int x=IniGetInt(sec,k,OFFSCREEN);
+    snprintf(k,sizeof(k),"%s_y",key); int y=IniGetInt(sec,k,OFFSCREEN);
+    snprintf(k,sizeof(k),"%s_w",key); int w=IniGetInt(sec,k,0);
+    snprintf(k,sizeof(k),"%s_h",key); int h=IniGetInt(sec,k,0);
+    SetRect(r,x,y,x+w,y+h);
+    if(ok) *ok=(x!=OFFSCREEN&&y!=OFFSCREEN&&w>8&&h>8&&RectOnScreen(r));
+}
+static void IniPutRect(const char*sec,const char*key,const RECT*r)
+{
+    if(!r||r->right<=r->left||r->bottom<=r->top) return;
+    char k[40];
+    snprintf(k,sizeof(k),"%s_x",key); IniPutInt(sec,k,r->left);
+    snprintf(k,sizeof(k),"%s_y",key); IniPutInt(sec,k,r->top);
+    snprintf(k,sizeof(k),"%s_w",key); IniPutInt(sec,k,r->right-r->left);
+    snprintf(k,sizeof(k),"%s_h",key); IniPutInt(sec,k,r->bottom-r->top);
+}
+
+static RECT g_mainRect={0,0,0,0};
+static BOOL g_mainRectValid=FALSE;
+
+static void LoadSettings(void)
+{
+    IniInit();
+    g_lang=IniGetInt("prefs","lang",L_EN);
+    if(g_lang!=L_ZH) g_lang=L_EN;
+    g_modVK=(int)IniGetInt("prefs","mod",g_modVK);
+    g_pauseVK=(int)IniGetInt("prefs","pause",g_pauseVK);
+    g_frameColor=IniGetColor("prefs","framecolor",g_frameColor);
+    g_showSkin   =IniGetBool("prefs","skin",TRUE);
+    g_rgbAtCursor=IniGetBool("prefs","rgbatcursor",TRUE);
+    g_clipping   =IniGetBool("prefs","clipping",TRUE);
+    g_ignoreBars =IniGetBool("prefs","ignorebars",TRUE);
+    g_hdrNorm    =IniGetBool("prefs","hdrnorm",TRUE);
+    g_wfRGB      =IniGetBool("prefs","wfrgb",FALSE);
+    g_split      =IniGetBool("prefs","split",FALSE);
+    g_zoom2      =IniGetBool("prefs","zoom2",FALSE);
+    g_brightness =IniGetDbl("prefs","brightness",1.0);
+    if(g_brightness<0.25) g_brightness=0.25;
+    if(g_brightness>3.0)  g_brightness=3.0;
+
+    for(int i=0;i<SC_COUNT;i++){
+        char k[40];
+        if(i!=SC_VEC){
+            snprintf(k,sizeof(k),"%s_on",SC_KEY[i]);
+            g_sc[i].on=IniGetBool("scopes",k,FALSE);
+        }
+        snprintf(k,sizeof(k),"%s_prop",SC_KEY[i]);
+        double p=IniGetDbl("scopes",k,1.0);
+        g_sc[i].prop=(p>0.3)?p:1.0;   /* 0.3 = le minimum que le glisseur produit */
+        if(i!=SC_VEC){
+            IniGetRect("detached",SC_KEY[i],&g_sc[i].wr,&g_sc[i].wrValid);
+        }
+    }
+    IniGetRect("window","main",&g_mainRect,&g_mainRectValid);
+}
+
+static void SaveSettings(void)
+{
+    if(!g_iniPath[0]) return;
+    IniPutInt("prefs","lang",g_lang);
+    IniPutInt("prefs","mod",g_modVK);
+    IniPutInt("prefs","pause",g_pauseVK);
+    IniPutColor("prefs","framecolor",g_frameColor);
+    IniPutBool("prefs","skin",g_showSkin);
+    IniPutBool("prefs","rgbatcursor",g_rgbAtCursor);
+    IniPutBool("prefs","clipping",g_clipping);
+    IniPutBool("prefs","ignorebars",g_ignoreBars);
+    IniPutBool("prefs","hdrnorm",g_hdrNorm);
+    IniPutBool("prefs","wfrgb",g_wfRGB);
+    IniPutBool("prefs","split",g_split);
+    IniPutBool("prefs","zoom2",g_zoom2);
+    IniPutDbl("prefs","brightness",g_brightness);
+
+    char k[40];
+    for(int i=0;i<SC_COUNT;i++){
+        if(i!=SC_VEC){
+            snprintf(k,sizeof(k),"%s_on",SC_KEY[i]);
+            IniPutBool("scopes",k,g_sc[i].on);
+        }
+        snprintf(k,sizeof(k),"%s_prop",SC_KEY[i]);
+        IniPutDbl("scopes",k,g_sc[i].prop);
+    }
+
+    /* fenetre principale : ignore l'etat minimise, qui n'est pas une place */
+    if(g_hMain&&!IsIconic(g_hMain)&&IsWindowVisible(g_hMain)){
+        RECT r;
+        if(GetWindowRect(g_hMain,&r)){ g_mainRect=r; g_mainRectValid=TRUE; }
+    }
+    if(g_mainRectValid) IniPutRect("window","main",&g_mainRect);
+
+    for(int i=SC_WAVE;i<SC_COUNT;i++){
+        if(g_sc[i].wnd&&!IsIconic(g_sc[i].wnd)){
+            RECT r;
+            if(GetWindowRect(g_sc[i].wnd,&r)){ g_sc[i].wr=r; g_sc[i].wrValid=TRUE; }
+        }
+        if(g_sc[i].wrValid) IniPutRect("detached",SC_KEY[i],&g_sc[i].wr);
+    }
+}
 
 static void RenderAll(void);
 static void RecomputeLayout(HWND);
@@ -134,6 +502,10 @@ static void ApplySplitMode(void);
 static void FitWindowToContent(HWND);
 static void EnsureScopeBmp(int idx,int w,int h);
 static void RenderScope(int idx);
+static void ApplyLanguage(void);
+static void CreateFonts(void);
+static void DestroyFonts(void);
+
 
 /* ================= PRNG (dithering anti-moire) ================= */
 static unsigned int g_rng=2463534242u;
@@ -293,9 +665,9 @@ static void TplVec(void)
         }
     }
 
-    typedef struct{const char*n;BYTE r,g,b;}T;
-    T t[6]={{"R",255,0,0},{"J",255,255,0},{"V",0,255,0},
-            {"C",0,255,255},{"B",0,0,255},{"M",255,0,255}};
+    typedef struct{const wchar_t*n;BYTE r,g,b;}T;
+    T t[6]={{L"R",255,0,0},{L"J",255,255,0},{L"V",0,255,0},
+            {L"C",0,255,255},{L"B",0,0,255},{L"M",255,0,255}};
     int tx[6],ty[6];
     int half=(int)(D*0.011); if(half<3) half=3;
     for(int i=0;i<6;i++){
@@ -309,15 +681,24 @@ static void TplVec(void)
 
     HGDIOBJ of=SelectObject(s->dc,g_hFont);
     SetBkMode(s->dc,TRANSPARENT);
+    TEXTMETRICW tm; GetTextMetricsW(s->dc,&tm);
+    int th=tm.tmHeight;
     for(int i=0;i<6;i++){
         SetTextColor(s->dc,RGB(150,150,155));
-        TextOutA(s->dc,tx[i]+half+5,ty[i]-8,t[i].n,(int)strlen(t[i].n));
+        int lw=WideW(s->dc,t[i].n);
+        int lx=tx[i]+half+UI(4);
+        if(lx+lw>W-2) lx=tx[i]-half-UI(4)-lw;   /* la lettre passe a gauche */
+        DrawTxtW(s->dc,lx,ty[i]-th/2,t[i].n);
     }
     SetTextColor(s->dc,RGB(120,120,124));
-    TextOutA(s->dc,cx+5,3,"100%",4);
+    DrawTxtW(s->dc,cx+UI(4),UI(2),Tr(S_PCT100));
     if(g_showSkin){
         SetTextColor(s->dc,RGB(225,160,120));
-        TextOutA(s->dc,(int)sx2+((sx2>=cx)?5:-34),(int)sy2+((sy2>=cy)?2:-16),"skin",4);
+        const wchar_t*sk=Tr(S_SKIN);
+        int sw=WideW(s->dc,sk);
+        int skx=((int)sx2>=cx)?((int)sx2+UI(5)):((int)sx2-UI(5)-sw);
+        int sky=((int)sy2>=cy)?((int)sy2+UI(2)):((int)sy2-th-UI(2));
+        DrawTxtW(s->dc,skx,sky,sk);
     }
     SelectObject(s->dc,of);
     memcpy(s->tpl,s->bits,(size_t)W*H*sizeof(DWORD));
@@ -343,14 +724,17 @@ static void TplWaveLike(int idx,BOOL parade)
     HGDIOBJ of=SelectObject(s->dc,g_hFont);
     SetBkMode(s->dc,TRANSPARENT);
     SetTextColor(s->dc,RGB(120,120,124));
-    const char*lbl[5]={"0","25","50","75","100"};
+    const wchar_t*lbl[5]={L"0",L"25",L"50",L"75",L"100"};
     for(int p=0;p<=4;p++){
         int y=(int)((1.0-p/4.0)*(H-1));
         int ty=y-14; if(ty<1) ty=1;
-        TextOutA(s->dc,3,ty,lbl[p],(int)strlen(lbl[p]));
+        DrawTxtW(s->dc,3,ty,lbl[p]);
     }
     SetTextColor(s->dc,RGB(110,110,116));
-    TextOutA(s->dc,W-62,3,parade?"parade":"waveform",parade?6:8);
+    {   /* repere colle au bord droit, quelle que soit la langue */
+        const wchar_t*m=Tr(parade?S_PARADE:S_WAVEFORM);
+        DrawTxtW(s->dc,W-UI(3)-WideW(s->dc,m),UI(2),m);
+    }
     SelectObject(s->dc,of);
     memcpy(s->tpl,s->bits,(size_t)W*H*sizeof(DWORD));
 }
@@ -375,10 +759,10 @@ static void TplHist(void)
     HGDIOBJ of=SelectObject(s->dc,g_hFont);
     SetBkMode(s->dc,TRANSPARENT);
     SetTextColor(s->dc,RGB(120,120,124));
-    TextOutA(s->dc,4,H-18,"0",1);
-    TextOutA(s->dc,W-30,H-18,"255",3);
+    DrawTxtW(s->dc,4,H-18,L"0");
+    DrawTxtW(s->dc,W-UI(4)-WideW(s->dc,Tr(S_255)),H-18,Tr(S_255));
     SetTextColor(s->dc,RGB(110,110,116));
-    TextOutA(s->dc,4,3,"RGB",3);
+    DrawTxtW(s->dc,4,3,Tr(S_RGB));
     SelectObject(s->dc,of);
     memcpy(s->tpl,s->bits,(size_t)W*H*sizeof(DWORD));
 }
@@ -636,10 +1020,542 @@ static HBITMAP g_capBmp=NULL;
 static void   *g_capBits=NULL;
 static int     g_capW=0,g_capH=0;
 
+/* bandes de fond de la derniere capture (haut, bas, gauche, droite), en px */
+static int     g_barT=0,g_barB=0,g_barL=0,g_barR=0;
+static int     g_prevCols=-1;   /* colonnes echantillonnees : repere un changement de cadrage */
+
+/* ================= exclusion des bandes de fond =================
+   Un lecteur d'images qui affiche une photo d'un format different de sa
+   fenetre remplit le reste avec une couleur unie : bandes noires/grises/blanches
+   en haut et en bas (letterbox) ou a gauche et a droite (pillarbox). Ces bandes
+   sont collees aux bords, occupent une grande surface et fausseraient completement
+   l'histogramme, le waveform et le vectorscope.
+
+   Une bande est ici une suite de lignes (ou colonnes) consecutives partant du
+   bord dont chacune est quasi uniforme (aucune texture) et dont la couleur reste
+   egale a celle de la premiere ligne. Trois garde-fous evitent de confondre une
+   zone unie de l'image avec une bande :
+     - la couleur doit etre neutre (faible ecart entre canaux) : un fond de
+       lecteur est noir, gris ou blanc, un ciel bleu ou un mur colore ne l'est pas;
+     - les deux cotes opposes, quand ils existent tous les deux, doivent avoir
+       la meme couleur (un ciel clair en haut de photo ne passe donc pas);
+     - les 5% extremes de chaque ligne sont ignores, sinon les coins arrondis de
+       certaines fenetres bloqueraient la detection.                              */
+/* Une bande de fond est une couleur unie exacte : une capture d'ecran n'a ni
+   bruit ni compression. Les tolerances restent donc TRES serrees. Trop larges,
+   elles laissent la detection "deborder" dans une zone sombre et lisse de
+   l'image (coin de ciel nocturne, degrade de vignettage) et le repere de la
+   zone mesuree se decale vers l'interieur de la photo : la bande doit s'arreter
+   au premier pixel qui n'est pas identique au fond. */
+#define BAR_FLAT_TOL    3     /* ecart max entre pixels d'une meme ligne   */
+#define BAR_COLOR_TOL   4     /* ecart max entre la ligne et la reference  */
+#define BAR_NEUTRAL_TOL 20    /* ecart max entre canaux d'un fond neutre   */
+
+static BOOL BarLineColor(BYTE*px,int w,int h,int step,int line,BOOL horiz,BYTE out[3])
+{
+    int dim=horiz?w:h;
+    int m=dim/20;
+    int ldim=horiz?h:w;
+    if(line<0||line>=ldim||m<=0) return FALSE;
+
+    int mn[3]={255,255,255},mx[3]={0,0,0};
+    long s[3]={0,0,0};
+    int n=0;
+    for(int i=m;i<dim-m;i+=step){
+        BYTE*p=horiz?(px+((size_t)line*w+i)*4):(px+((size_t)i*w+line)*4);
+        for(int k=0;k<3;k++){
+            BYTE c=p[2-k];              /* p[2]=R, p[1]=G, p[0]=B */
+            if(c<mn[k])mn[k]=c;
+            if(c>mx[k])mx[k]=c;
+            s[k]+=c;
+        }
+        n++;
+    }
+    if(n<=0) return FALSE;
+    for(int k=0;k<3;k++)
+        if(mx[k]-mn[k]>BAR_FLAT_TOL) return FALSE;
+    for(int k=0;k<3;k++) out[k]=(BYTE)(s[k]/n);
+    return TRUE;
+}
+
+static int BarBand(BYTE*px,int w,int h,int step,BOOL horiz,int start,int delta,int maxScan,BYTE ref[3])
+{
+    int thick=0;
+    for(int i=0;i<maxScan;i++){
+        BYTE c[3];
+        if(!BarLineColor(px,w,h,step,start+delta*i,horiz,c)) break;
+        if(thick==0){
+            int mx=c[0],mn=c[0];
+            for(int k=1;k<3;k++){
+                if(c[k]>mx)mx=c[k];
+                if(c[k]<mn)mn=c[k];
+            }
+            if(mx-mn>BAR_NEUTRAL_TOL) break;     /* fond colore : pas une bande */
+            ref[0]=c[0]; ref[1]=c[1]; ref[2]=c[2];
+        } else {
+            int d=0;
+            for(int k=0;k<3;k++){
+                int dd=(int)c[k]-(int)ref[k];
+                if(dd<0) dd=-dd;
+                if(dd>d) d=dd;
+            }
+            if(d>BAR_COLOR_TOL) break;          /* couleur qui derive : on s'arrete */
+        }
+        thick++;
+    }
+    return thick;
+}
+
+static BOOL BarSameColor(const BYTE a[3],const BYTE b[3])
+{
+    for(int k=0;k<3;k++){
+        int d=(int)a[k]-(int)b[k];
+        if(d<0) d=-d;
+        if(d>BAR_COLOR_TOL) return FALSE;
+    }
+    return TRUE;
+}
+
+static void DetectBars(BYTE*px,int w,int h,int*t,int*b,int*l,int*r)
+{
+    *t=*b=*l=*r=0;
+    if(w<32||h<32) return;
+
+    int sh=(w>600)?(w/600):1;      /* ~600 echantillons par ligne   */
+    int sv=(h>600)?(h/600):1;      /* ~600 echantillons par colonne */
+    int maxV=h/2,maxH=w/2;
+
+    BYTE rt[3]={0,0,0},rb[3]={0,0,0},rl[3]={0,0,0},rr[3]={0,0,0};
+    int bt=BarBand(px,w,h,sh,TRUE,0,+1,maxV,rt);
+    int bb=BarBand(px,w,h,sh,TRUE,h-1,-1,maxV,rb);
+    int bl=BarBand(px,w,h,sv,FALSE,0,+1,maxH,rl);
+    int br=BarBand(px,w,h,sv,FALSE,w-1,-1,maxH,rr);
+
+    /* epaisseur minimale : une bande fine isolee est du bruit, pas un cadrage */
+    int minV=(h/150>4)?(h/150):4;
+    int minH=(w/150>4)?(w/150):4;
+    if(bt<minV) bt=0;
+    if(bb<minV) bb=0;
+    if(bl<minH) bl=0;
+    if(br<minH) br=0;
+
+    if(bt&&bb&&!BarSameColor(rt,rb)) bt=bb=0;
+    if(bl&&br&&!BarSameColor(rl,rr)) bl=br=0;
+
+    /* il doit rester de l'image : pas plus de 80% retire sur un axe
+       (une photo panoramique tres letterboxee reste dans les clous) */
+    if(bt+bb>(h*8)/10) bt=bb=0;
+    if(bl+br>(w*8)/10) bl=br=0;
+
+    *t=bt; *b=bb; *l=bl; *r=br;
+}
+
+/* ================= sortie HDR =================
+   BitBlt sur le DC d'ecran ne rend JAMAIS que 8 bits par canal. Sur une sortie
+   HDR, ce qu'il recupere est deja le rendu que Windows a bien voulu redescendre
+   en SDR. Deux comportements opposes ont ete observes selon l'application :
+
+     - la plage est ecrasee : tout ce qui depasse le blanc SDR revient a 255.
+       La, l'information est PERDUE avant nous. Tous ces pixels ont la meme
+       valeur : aucune echelle, aucune courbe, aucun etirement ne peut les
+       re-separer. On ne peut que le mesurer et le dire.
+     - la plage est comprimee vers le bas : le lecteur rend tout sous 255 (par
+       exemple blanc max mesure = 180). La, l'information est intacte mais
+       mal etalee, et une mise a l'echelle lineaire est juste : elle rend a
+       l'histogramme les 0..255 qu'il aurait du avoir.
+
+   On distingue les deux a chaque capture (max mesure + % d'echantillons a 255),
+   on etale quand c'est recuperable, et on l'affiche dans les deux cas. */
+static BOOL     g_hdrActive=FALSE;
+static DWORD    g_hdrTick=0;
+static int      g_hdrSatPct=0;    /* % d'echantillons a 255 sur un canal */
+static double   g_hdrGain=1.0;    /* correction appliquee, 1 = rien */
+
+static BOOL HdrActiveAt(POINT phys)
+{
+    HMONITOR hm=MonitorFromPoint(phys,MONITOR_DEFAULTTONEAREST);
+    if(!hm) return FALSE;
+    MONITORINFOEXW mi; memset(&mi,0,sizeof mi);
+    mi.cbSize=sizeof mi;
+    GetMonitorInfoW(hm,(LPMONITORINFO)&mi);
+
+    UINT32 np=0,nm=0;
+    if(GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,&np,&nm)!=ERROR_SUCCESS) return FALSE;
+    DISPLAYCONFIG_PATH_INFO *pa=(DISPLAYCONFIG_PATH_INFO*)calloc(np,sizeof *pa);
+    DISPLAYCONFIG_MODE_INFO *mo=(DISPLAYCONFIG_MODE_INFO*)calloc(nm,sizeof *mo);
+    BOOL hdr=FALSE,any=FALSE,matched=FALSE;
+
+    if(pa&&mo&&QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,&np,pa,&nm,mo,NULL)==ERROR_SUCCESS){
+        for(UINT32 i=0;i<np;i++){
+            if(!(pa[i].flags&DISPLAYCONFIG_PATH_ACTIVE)) continue;
+
+            /* le chemin correspond-il au moniteur sous la zone ? */
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME sn; memset(&sn,0,sizeof sn);
+            sn.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            sn.header.size=sizeof sn;
+            sn.header.adapterId=pa[i].sourceInfo.adapterId;
+            sn.header.id=pa[i].sourceInfo.id;
+            BOOL same=(DisplayConfigGetDeviceInfo(&sn.header)==ERROR_SUCCESS)
+                   && (lstrcmpiW(sn.viewGdiDeviceName,mi.szDevice)==0);
+
+            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO g; memset(&g,0,sizeof g);
+            g.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            g.header.size=sizeof g;
+            g.header.adapterId=pa[i].targetInfo.adapterId;
+            g.header.id=pa[i].targetInfo.id;
+            if(DisplayConfigGetDeviceInfo(&g.header)!=ERROR_SUCCESS) continue;
+
+            if(g.advancedColorEnabled) any=TRUE;
+            if(same){ hdr=g.advancedColorEnabled?TRUE:FALSE; matched=TRUE; break; }
+        }
+    }
+    free(pa); free(mo);
+    return matched?hdr:any;   /* moniteur non resolu : on prend le pire cas */
+}
+
+/* ================= capture WGC (HDR, FP16 lineaire) =================
+   Seulement sous un C qui expose les en-tetes WinRT (MinGW). Ailleurs, les
+   stubs en bas laissent la voie fermee et BitBlt travaille seul. */
+#if defined(__GNUC__)
+/*
+   Tant que la sortie est en PQ, BitBlt nous rend une image deja ecrasee : les
+   pixels a 255 sont differents a l'ecran mais identiques chez nous. WGC rend la
+   texture du desktop AVANT cette compression, en FP16 lineaire.
+
+   Deux choses a connaitre, et aucune ne se devine :
+     - le blanc SDR dans cette echelle (mesure ici : 3,5000 sur ce poste). Il
+       depend du reglage "SDR content display brightness" de Windows, donc il
+       faut le mesurer sur chaque machine, et le remesurer si l'ecran change ;
+     - la crete de l'image. L'axe des scopes est etire jusque-la, ce qui
+       remonte le blanc SDR tout en laissant les hautes lumieres respirer au
+       lieu de les coller a 255.
+   Tout ceci est optionnel : si WGC n'est pas disponible, on reste sur BitBlt. */
+
+static ID3D11Device                *g_wDev=NULL;
+static ID3D11DeviceContext         *g_wCtx=NULL;
+static IGraphicsCaptureItem        *g_wItem=NULL;
+static IDirect3D11CaptureFramePool *g_wPool=NULL;
+static IGraphicsCaptureSession     *g_wSess=NULL;
+static ID3D11Texture2D             *g_wStage=NULL;
+static int   g_wW=0,g_wH=0,g_wReady=0,g_wTried=0;
+static double g_sdrWhite=0.0;      /* FP16 du blanc SDR ; 0 = pas encore mesure */
+static DWORD  g_calTick=0;         /* cooldown des tentatives de calibrage */
+static double g_hdrStretch=1.0;    /* etirement d'axe applique a la frame */
+
+static BYTE* g_wMap=NULL; static LONG g_wPitch=0;
+
+static HSTRING WStr(const wchar_t*s){ HSTRING h=NULL;
+    WindowsCreateString(s,(UINT32)wcslen(s),&h); return h; }
+
+static void WgcClose(void){
+    if(g_wSess){ IGraphicsCaptureSession_Release(g_wSess); g_wSess=NULL; }
+    if(g_wPool){ IDirect3D11CaptureFramePool_Release(g_wPool); g_wPool=NULL; }
+    if(g_wItem){ IGraphicsCaptureItem_Release(g_wItem); g_wItem=NULL; }
+    if(g_wStage){ ID3D11Texture2D_Release(g_wStage); g_wStage=NULL; }
+    if(g_wCtx){ ID3D11DeviceContext_Release(g_wCtx); g_wCtx=NULL; }
+    if(g_wDev){ ID3D11Device_Release(g_wDev); g_wDev=NULL; }
+    g_wReady=0; g_wW=g_wH=0;
+}
+
+static BOOL WgcOpen(HMONITOR hm)
+{
+    if(g_wTried) return g_wReady;
+    g_wTried=1;
+    HRESULT hr=RoInitialize(RO_INIT_MULTITHREADED);
+    if(FAILED(hr)&&hr!=RPC_E_CHANGED_MODE) return FALSE;
+
+    hr=D3D11CreateDevice(NULL,D3D_DRIVER_TYPE_HARDWARE,NULL,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                         NULL,0,D3D11_SDK_VERSION,&g_wDev,NULL,&g_wCtx);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+
+    IGraphicsCaptureItemInterop *io=NULL;
+    hr=RoGetActivationFactory(WStr(L"Windows.Graphics.Capture.GraphicsCaptureItem"),
+        &IID_IGraphicsCaptureItemInterop,(void**)&io);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+    hr=IGraphicsCaptureItemInterop_CreateForMonitor(io,hm,&IID_IGraphicsCaptureItem,(void**)&g_wItem);
+    IGraphicsCaptureItemInterop_Release(io);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+
+    SizeInt32 sz; memset(&sz,0,sizeof sz);
+    if(FAILED(IGraphicsCaptureItem_get_Size(g_wItem,&sz))||sz.Width<2||sz.Height<2){
+        WgcClose(); return FALSE; }
+    g_wW=sz.Width; g_wH=sz.Height;
+
+    IDXGIDevice *dxgi=NULL;
+    hr=ID3D11Device_QueryInterface(g_wDev,&IID_IDXGIDevice,(void**)&dxgi);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+    IInspectable *wrap=NULL;
+    hr=CreateDirect3D11DeviceFromDXGIDevice(dxgi,&wrap);
+    IDXGIDevice_Release(dxgi);
+    if(FAILED(hr)||!wrap){ WgcClose(); return FALSE; }
+
+    IDirect3D11CaptureFramePoolStatics2 *st2=NULL;
+    hr=RoGetActivationFactory(WStr(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool"),
+        &IID_IDirect3D11CaptureFramePoolStatics2,(void**)&st2);
+    if(FAILED(hr)){ IInspectable_Release(wrap); WgcClose(); return FALSE; }
+    hr=IDirect3D11CaptureFramePoolStatics2_CreateFreeThreaded(st2,
+        (IDirect3DDevice*)wrap,(DirectXPixelFormat)DXGI_FORMAT_R16G16B16A16_FLOAT,2,sz,&g_wPool);
+    IInspectable_Release(wrap);
+    IDirect3D11CaptureFramePoolStatics2_Release(st2);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+
+    hr=IDirect3D11CaptureFramePool_CreateCaptureSession(g_wPool,g_wItem,&g_wSess);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+    IGraphicsCaptureSession3 *s3=NULL;
+    if(SUCCEEDED(IGraphicsCaptureSession_QueryInterface(g_wSess,
+            &IID_IGraphicsCaptureSession3,(void**)&s3))){
+        IGraphicsCaptureSession3_put_IsBorderRequired(s3,false);
+        IGraphicsCaptureSession3_Release(s3);
+    }
+    hr=IGraphicsCaptureSession_StartCapture(g_wSess);
+    if(FAILED(hr)){ WgcClose(); return FALSE; }
+
+    g_wReady=1;
+    return TRUE;
+}
+
+/* Une frame du desktop entier. Le contenu ne bouge pas tout seul : on decale le
+   curseur de quelques pixels pour forcer WGC a en produire une. */
+static BOOL WgcGrab(void)
+{
+    if(!g_wReady) return FALSE;
+    IDirect3D11CaptureFrame *fr=NULL;
+    POINT c0; GetCursorPos(&c0);
+    for(int i=0;i<40&&!fr;i++){
+        SetCursorPos(c0.x+((i&1)?6:0),c0.y+((i&2)?6:0));
+        IDirect3D11CaptureFramePool_TryGetNextFrame(g_wPool,&fr);
+        if(!fr) Sleep(20);
+    }
+    SetCursorPos(c0.x,c0.y);
+    if(!fr) return FALSE;
+
+    BOOL ok=FALSE;
+    IDirect3DSurface *sf=NULL;
+    IDirect3DDxgiInterfaceAccess *acc=NULL;
+    ID3D11Texture2D *tex=NULL;
+    if(SUCCEEDED(IDirect3D11CaptureFrame_get_Surface(fr,&sf))&&
+       SUCCEEDED(IDirect3DSurface_QueryInterface(sf,&IID_DxgiAccess,(void**)&acc))&&
+       SUCCEEDED(acc->lpVtbl->GetInterface(acc,&IID_ID3D11Texture2D,(void**)&tex))){
+        D3D11_TEXTURE2D_DESC td; ID3D11Texture2D_GetDesc(tex,&td);
+        if(td.Format==DXGI_FORMAT_R16G16B16A16_FLOAT){
+            if(!g_wStage||g_wW!=(int)td.Width||g_wH!=(int)td.Height){
+                if(g_wStage) ID3D11Texture2D_Release(g_wStage);
+                D3D11_TEXTURE2D_DESC sd=td;
+                sd.Usage=D3D11_USAGE_STAGING; sd.BindFlags=0;
+                sd.CPUAccessFlags=D3D11_CPU_ACCESS_READ; sd.MiscFlags=0;
+                g_wStage=NULL;
+                if(SUCCEEDED(ID3D11Device_CreateTexture2D(g_wDev,&sd,NULL,&g_wStage))){
+                    g_wW=(int)td.Width; g_wH=(int)td.Height;
+                }
+            }
+            if(g_wStage){
+                ID3D11DeviceContext_CopyResource(g_wCtx,(ID3D11Resource*)g_wStage,(ID3D11Resource*)tex);
+                D3D11_MAPPED_SUBRESOURCE mp;
+                if(SUCCEEDED(ID3D11DeviceContext_Map(g_wCtx,(ID3D11Resource*)g_wStage,
+                        0,D3D11_MAP_READ,0,&mp))){
+                    g_wMap=(BYTE*)mp.pData; g_wPitch=(LONG)mp.RowPitch; ok=TRUE;
+                }
+            }
+        }
+    }
+    if(tex) ID3D11Texture2D_Release(tex);
+    if(acc) acc->lpVtbl->Release(acc);
+    if(sf)  IDirect3DSurface_Release(sf);
+    IDirect3D11CaptureFrame_Release(fr);
+    return ok;
+}
+
+static void WgcUngrab(void){
+    if(g_wMap&&g_wStage){ ID3D11DeviceContext_Unmap(g_wCtx,(ID3D11Resource*)g_wStage,0); }
+    g_wMap=NULL; g_wPitch=0;
+}
+
+static inline float F16(unsigned short h){
+    unsigned sign=(unsigned)(h&0x8000u)<<16, e=(h>>10)&0x1Fu, m=h&0x3FFu;
+    union{unsigned u;float f;}r;
+    if(e==0)         r.f=(float)m*5.9604644775390625e-8f;   /* 2^-24 */
+    else if(e==0x1F) r.u=sign|0x7F800000u|(m<<13);
+    else             r.u=sign|((e+112u)<<23)|(m<<13);
+    return r.f;
+}
+/* OETF sRGB ETENDU au-dela de 1 : la loi en pow() se prolonge toute seule, ce
+   qui laisse les super-blancs (n > 1) au-dessus de l'encodage du blanc au lieu
+   de les ecraser. Renvoie 1.0 pour n = 1.0 (le blanc SDR). */
+static inline double OetfExt(double n){
+    if(n<=0.0) return 0.0;
+    if(n<=0.0031308) return n*12.92;
+    return 1.055*pow(n,1.0/2.4)-0.055;
+}
+
+/* crete de la zone, exprimee en multiples du blanc SDR */
+static double WgcPeak(int x0,int y0,int w,int h)
+{
+    double mx=0.0;
+    for(int y=0;y<h;y+=2){
+        unsigned short*row=(unsigned short*)(g_wMap+(size_t)(y0+y)*g_wPitch);
+        for(int x=0;x<w;x+=2){
+            int i=(x0+x)*4;
+            double v=F16(row[i]); if(F16(row[i+1])>v)v=F16(row[i+1]); if(F16(row[i+2])>v)v=F16(row[i+2]);
+            if(v>mx) mx=v;
+        }
+    }
+    return mx/(g_sdrWhite>0?g_sdrWhite:1.0);
+}
+
+/* zone -> DIB 32bpp.
+
+   'scale' est la crete de la zone exprimee en multiples du blanc SDR (>= 1).
+   La regle qui compte : l'etirement se fait APRES l'encodage, pas avant.
+   Diviser les trois canaux par un meme facteur EN LUMIERE LINEAIRE puis coder
+   ne preserve PAS la teinte - l'OETF est non lineaire, donc les rapports entre
+   canaux encodes changent, et tout le nuage du vectorscope se deplace et se
+   contracte : c'est exactement ce qu'on voyait entre HDR et SDR.
+   Diviser les valeurs ENCODEES par OetfExt(scale) est une homothetie sur
+   l'axe 0..255 : rapports entre canaux conserves, teinte et saturation
+   inchangees, seule la luminosite est recomprimee.
+   Et quand scale vaut 1 (aucun super-blanc) OetfExt(1)=1 : on retombe
+   exactement sur le codage SDR, donc les deux modes sont comparables. */
+static void WgcBlit(int x0,int y0,int w,int h,BYTE*dst,double scale)
+{
+    double denom=OetfExt(scale);
+    if(denom<1.0) denom=1.0;
+    double inv=1.0/denom;
+    for(int y=0;y<h;y++){
+        unsigned short*row=(unsigned short*)(g_wMap+(size_t)(y0+y)*g_wPitch);
+        BYTE*d=dst+(size_t)y*w*4;
+        for(int x=0;x<w;x++){
+            int i=(x0+x)*4;
+            for(int c=0;c<3;c++){
+                double n=(double)F16(row[i+c])/g_sdrWhite;   /* 1.0 = blanc SDR */
+                int q=(int)(OetfExt(n)*inv*255.0+0.5);
+                d[x*4+c]=(BYTE)(q<0?0:(q>255?255:q));
+            }
+            d[x*4+3]=0xFF;
+        }
+    }
+}
+
+/* Mesure le blanc SDR : un aplat 255.0.0 a l'ecran, relu en FP16. On ne peut
+   pas le deviner - c'est le reglage Windows "SDR content display brightness"
+   qui le fixe, different sur chaque machine. */
+static LRESULT CALLBACK CalProc(HWND h,UINT m,WPARAM w,LPARAM l){
+    if(m==WM_PAINT){ PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps);
+        RECT rc; GetClientRect(h,&rc); FillRect(dc,&rc,(HBRUSH)GetStockObject(WHITE_BRUSH));
+        EndPaint(h,&ps); return 0; }
+    if(m==WM_ERASEBKGND) return 1;
+    return DefWindowProc(h,m,w,l);
+}
+
+static void CalibrateSdrWhite(void)
+{
+    if(!g_wReady) return;
+    static const char cls[]="SWCalibSwatch";
+    static BOOL reg=FALSE;
+    if(!reg){
+        WNDCLASSA wc; memset(&wc,0,sizeof wc);
+        wc.lpfnWndProc=CalProc; wc.hInstance=g_inst; wc.lpszClassName=cls;
+        RegisterClassA(&wc); reg=TRUE;
+    }
+    int S=40;
+    /* quelques positions candidates : il faut que l'aplat soit vraiment visible */
+    int cx[4]={8,8,g_wW-S-8,g_wW/2-S/2}, cy[4]={8,g_wH-S-8,g_wH-S-8,8};
+    for(int t=0;t<4;t++){
+        RECT r={cx[t],cy[t],cx[t]+S,cy[t]+S};
+        HWND hs=CreateWindowExA(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+            cls,"",WS_POPUP,r.left,r.top,S,S,NULL,NULL,g_inst,NULL);
+        if(!hs) continue;
+        ShowWindow(hs,SW_SHOWNOACTIVATE); UpdateWindow(hs);
+        Sleep(120);
+        SetWindowPos(hs,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        Sleep(80);
+        POINT c={r.left+S/2,r.top+S/2};
+        if(WindowFromPoint(c)==hs && WgcGrab()){
+            unsigned short*row=(unsigned short*)(g_wMap+(size_t)c.y*g_wPitch);
+            double v=F16(row[c.x*4]);
+            WgcUngrab();
+            if(v>0.2&&v<64.0){ g_sdrWhite=v; DestroyWindow(hs); return; }
+        }
+        WgcUngrab();
+        DestroyWindow(hs);
+    }
+    /* echec : on garde la derniere valeur connue (1.0 = SDR pur) */
+}
+
+#else  /* pas de WinRT en C sous MSVC : voie HDR fermee */
+static int   g_wTried=0;
+static int   g_wW=0,g_wH=0;
+static DWORD g_calTick=0;
+static double g_sdrWhite=0.0, g_hdrStretch=1.0;
+static BOOL  WgcOpen(HMONITOR h){ (void)h; return FALSE; }
+static BOOL  WgcGrab(void){ return FALSE; }
+static void  WgcUngrab(void){}
+static void  WgcClose(void){}
+static void  CalibrateSdrWhite(void){}
+static double WgcPeak(int a,int b,int c,int d){ (void)a;(void)b;(void)c;(void)d; return 1.0; }
+static void  WgcBlit(int a,int b,int c,int d,BYTE*e,double f){
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;
+}
+#endif
+
+/* ---- barre de statut ----
+   Le statut est une chaine FORMATEE, donc figee dans la langue du moment : on
+   retient son identifiant et ses parametres pour pouvoir la refaire quand la
+   langue change, sinon la barre du bas resterait dans l'autre langue. */
+static int  g_statusId=-1;
+static int  g_statusW=0,g_statusH=0;
+static BOOL g_statusWgc=FALSE;
+
+static void HdrFrag(wchar_t*out,int cap,BOOL viaWgc)
+{
+    out[0]=0;
+    if(!g_hdrActive) return;
+    if(viaWgc){
+        if(g_hdrStretch>1.0001)
+            swprintf(out,cap,Tr(S_HDRSTRETCH),g_hdrStretch,g_sdrWhite);
+        else swprintf(out,cap,Tr(S_HDRWHITE),g_sdrWhite);
+    }
+    else if(g_hdrGain>1.001)
+        swprintf(out,cap,Tr(S_HDRGAIN),g_hdrGain);
+    else if(g_hdrSatPct>=5)
+        swprintf(out,cap,Tr(S_HDRSAT),g_hdrSatPct);
+    else lstrcpynW(out,Tr(S_HDR),cap);
+}
+static void SetStatusZone(BOOL bords,int w,int h,BOOL viaWgc)
+{
+    wchar_t hdr[64];
+    int id=bords?S_ZONEBORDS:S_ZONEACTIVE;
+    HdrFrag(hdr,64,viaWgc);
+    g_statusId=id; g_statusW=w; g_statusH=h; g_statusWgc=viaWgc;
+    if(bords) swprintf(g_status,256,Tr(id),w,h,g_barT,g_barB,g_barL,g_barR,hdr);
+    else      swprintf(g_status,256,Tr(id),w,h,hdr);
+}
+static void SetStatusMsg(int id)
+{
+    g_statusId=id; g_statusW=g_statusH=0;
+    lstrcpynW(g_status,Tr(id),256);
+}
+static void RefreshStatus(void)
+{
+    if(g_statusId==S_ZONEBORDS)      SetStatusZone(TRUE ,g_statusW,g_statusH,g_statusWgc);
+    else if(g_statusId==S_ZONEACTIVE)SetStatusZone(FALSE,g_statusW,g_statusH,g_statusWgc);
+    else if(g_statusId>=0)           SetStatusMsg(g_statusId);
+}
+
 static void Capture(RECT r,BOOL force)
 {
     int w=r.right-r.left,h=r.bottom-r.top;
     if(w<2||h<2) return;
+
+    /* etat HDR de l'ecran sous la zone, re-interroge toutes les 2 s : basculer
+       HDR/SDR sans deplacer la selection doit etre vu. Doit etre connu AVANT
+       de choisir la voie de capture. */
+    {
+        DWORD now=GetTickCount();
+        if(g_hdrTick==0||(DWORD)(now-g_hdrTick)>=2000){
+            POINT c={(r.left+r.right)/2,(r.top+r.bottom)/2};
+            g_hdrTick=now; g_hdrActive=HdrActiveAt(c);
+        }
+    }
 
     HDC scr=GetDC(NULL);
     if(!g_capDC) g_capDC=CreateCompatibleDC(scr);
@@ -661,14 +1577,56 @@ static void Capture(RECT r,BOOL force)
     }
     if(!g_capBmp){ ReleaseDC(NULL,scr); return; }
 
-    BitBlt(g_capDC,0,0,w,h,scr,r.left,r.top,SRCCOPY|CAPTUREBLT);
+    /* Sortie HDR ? Alors WGC : BitBlt nous rendrait l'image APRES la
+       compression HDR->SDR de Windows, avec les hautes lumieres deja collees a
+       255. WGC rend le FP16 lineaire d'avant, intact. */
+    g_hdrStretch=1.0;
+    int viaWgc=0;
+    if(g_hdrActive){
+        HMONITOR hm=MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW mi; memset(&mi,0,sizeof mi); mi.cbSize=sizeof mi;
+        if(WgcOpen(hm)&&GetMonitorInfoW(hm,(LPMONITORINFO)&mi)){
+            /* le blanc SDR se mesure une fois ; 0 = inconnu, donc on retente au
+               plus une fois toutes les 5 s (chaque tentative affiche un aplat
+               blanc a l'ecran, ca ne doit pas clignoter en continu) */
+            if(g_sdrWhite<=0.0&&(DWORD)(GetTickCount()-g_calTick)>=5000){
+                g_calTick=GetTickCount();
+                CalibrateSdrWhite();
+            }
+            int x0=r.left-mi.rcMonitor.left, y0=r.top-mi.rcMonitor.top;
+            /* on exige que la zone tienne dans le moniteur : le DIB est deja
+               alloue a w x h, le rogner ici les ferait desynchroniser */
+            if(x0>=0&&y0>=0&&x0+w<=g_wW&&y0+h<=g_wH&&g_sdrWhite>0.2&&WgcGrab()){
+                double peak=WgcPeak(x0,y0,w,h);
+                double scale=(peak>1.0)?peak:1.0;
+                g_hdrStretch=scale;
+                WgcBlit(x0,y0,w,h,(BYTE*)g_capBits,scale);
+                viaWgc=1;
+                WgcUngrab();
+            }
+        }
+    }
+    if(!viaWgc) BitBlt(g_capDC,0,0,w,h,scr,r.left,r.top,SRCCOPY|CAPTUREBLT);
     ReleaseDC(NULL,scr);
 
-    double area=(double)w*(double)h;
+    /* bandes de fond (letterbox / pillarbox) : on les mesure puis on les
+       retire de l'echantillonnage. Toute la geometrie en decoule (leur
+       epaisseur peut changer d'une image a l'autre). */
+    int bt=0,bb=0,bl=0,br=0;
+    if(g_ignoreBars) DetectBars((BYTE*)g_capBits,w,h,&bt,&bb,&bl,&br);
+
+    int ix0=bl,iy0=bt;
+    int iw=w-bl-br,ih=h-bt-bb;
+    if(iw<4||ih<4){                     /* zone utile vide : on garde tout */
+        ix0=0; iy0=0; iw=w; ih=h;
+        bt=bb=bl=br=0;
+    }
+
+    double area=(double)iw*(double)ih;
     int stride=(int)ceil(sqrt(area/(double)MAX_SAMPLES));
     if(stride<1) stride=1;
 
-    int nx=(w+stride-1)/stride,ny=(h+stride-1)/stride;
+    int nx=(iw+stride-1)/stride,ny=(ih+stride-1)/stride;
     int cap=nx*ny;
     if(cap>g_sCap){
         free(g_sR); free(g_sG); free(g_sB); free(g_sCol);
@@ -682,22 +1640,28 @@ static void Capture(RECT r,BOOL force)
     SeedRng(0x9E3779B9u);
     DWORD hash=2166136261u;
     int hstep=0;
+    int mx=0,nsat=0;                 /* niveau max mesure, echantillons a 255 */
     BYTE*px=(BYTE*)g_capBits;
-    for(int y=0;y<h;y+=stride){
+    for(int y=iy0;y<iy0+ih;y+=stride){
         int ci=0;
-        for(int x=0;x<w;x+=stride,ci++){
+        for(int x=ix0;x<ix0+iw;x+=stride,ci++){
             int sx=x,sy=y;
             if(stride>1){
                 sx=x+(int)((Jitter()+0.5)*stride);
                 sy=y+(int)((Jitter()+0.5)*stride);
-                if(sx>=w) sx=w-1;
-                if(sy>=h) sy=h-1;
+                if(sx>=ix0+iw) sx=ix0+iw-1;
+                if(sy>=iy0+ih) sy=iy0+ih-1;
             }
             BYTE*row=px+(size_t)sy*w*4;
             BYTE B=row[sx*4+0],G=row[sx*4+1],R=row[sx*4+2];
             g_sR[g_sCount]=R; g_sG[g_sCount]=G; g_sB[g_sCount]=B;
             g_sCol[g_sCount]=(WORD)ci;
             g_sCount++;
+            {
+                int pm=(R>G)?(R>B?R:B):(G>B?G:B);
+                if(pm>mx) mx=pm;
+                if(pm==255) nsat++;
+            }
             if((hstep++&3)==0){
                 hash^=R; hash*=16777619u;
                 hash^=G; hash*=16777619u;
@@ -706,10 +1670,36 @@ static void Capture(RECT r,BOOL force)
         }
     }
 
-    if(!force&&hash==g_lastHash) return;
-    g_lastHash=hash;
+    /* etat HDR de l'ecran sous la zone (re-interroge tous les 2 s : l'utilisateur
+       peut basculer HDR/SDR sans bouger la selection) */
+    g_hdrSatPct=g_sCount?(int)((long)nsat*100/g_sCount):0;
+    g_hdrGain=1.0;
+    /* la correction "plage comprimee" ne concerne que BitBlt : avec WGC l'image
+       est deja juste, et un contenu qui n'a tout simplement pas de hautes
+       lumieres ne doit surtout pas etre etire */
+    if(g_hdrActive&&g_hdrNorm&&!viaWgc&&mx>0&&mx<=250){
+        /* plage comprimee : information intacte, on ramene le blanc mesure a 255 */
+        g_hdrGain=255.0/(double)mx;
+        int half=mx/2;
+        for(int i=0;i<g_sCount;i++){
+            int v;
+            v=(g_sR[i]*255+half)/mx; g_sR[i]=(BYTE)(v>255?255:v);
+            v=(g_sG[i]*255+half)/mx; g_sG[i]=(BYTE)(v>255?255:v);
+            v=(g_sB[i]*255+half)/mx; g_sB[i]=(BYTE)(v>255?255:v);
+        }
+    }
 
-    snprintf(g_status,sizeof(g_status),"Zone : %d x %d px  -  suivi actif",w,h);
+    /* le hash ne couvre que les pixels retenus : si les bandes bougent, les
+       colonnes du waveform changent aussi -> on force le rendu. */
+    BOOL barsChanged=(bt!=g_barT||bb!=g_barB||bl!=g_barL||br!=g_barR);
+    BOOL geom=barsChanged||nx!=g_prevCols;
+    if(!force&&hash==g_lastHash&&!geom) return;
+    g_lastHash=hash;
+    g_barT=bt; g_barB=bb; g_barL=bl; g_barR=br; g_prevCols=nx;
+    /* le repere de la zone mesuree suit les bandes : on repeint l'overlay */
+    if(barsChanged&&g_hOverlay) InvalidateRect(g_hOverlay,NULL,FALSE);
+
+    SetStatusZone((bt||bb||bl||br)?TRUE:FALSE,w,h,viaWgc?TRUE:FALSE);
     g_hasSelection=TRUE;
     RenderAll();
 }
@@ -725,7 +1715,7 @@ static void SetTracking(BOOL on)
         Capture(g_selRectScreen,TRUE);
     } else {
         ShowWindow(g_hOverlay,SW_HIDE);
-        snprintf(g_status,sizeof(g_status),"Suivi en pause - cliquez sur ON pour reprendre.");
+        SetStatusMsg(S_PAUSED);
     }
     InvalidateRect(g_hMain,NULL,FALSE);
 }
@@ -734,9 +1724,10 @@ static void ResetZone(void)
 {
     g_hasSelection=FALSE; g_paused=FALSE;
     g_sCount=0; g_sCols=0; g_lastHash=0;
+    g_barT=g_barB=g_barL=g_barR=0; g_prevCols=-1;
     ShowWindow(g_hOverlay,SW_HIDE);
     RenderAll();
-    snprintf(g_status,sizeof(g_status),"Zone reinitialisee. ALT + clic gauche pour en definir une nouvelle.");
+    SetStatusMsg(S_RESETZONE);
     InvalidateRect(g_hMain,NULL,FALSE);
 }
 
@@ -754,6 +1745,16 @@ static LRESULT CALLBACK OverlayProc(HWND h,UINT m,WPARAM w,LPARAM l)
         HPEN p=CreatePen(PS_SOLID,2,g_frameColor);
         HGDIOBJ op=SelectObject(dc,p),obr=SelectObject(dc,GetStockObject(NULL_BRUSH));
         Rectangle(dc,lr.left,lr.top,lr.right,lr.bottom);
+
+        /* zone reellement mesuree (bandes de fond retirees) : repere blanc
+           discret en pointilles. Masque pendant le glisser : les bandes de la
+           capture precedente ne correspondent pas encore au rectangle en cours. */
+        if(!g_dragging&&(g_barT||g_barB||g_barL||g_barR)){
+            HPEN mp=CreatePen(PS_DOT,1,RGB(225,225,225));
+            HGDIOBJ om=SelectObject(dc,mp);
+            Rectangle(dc,lr.left+g_barL,lr.top+g_barT,lr.right-g_barR,lr.bottom-g_barB);
+            SelectObject(dc,om); DeleteObject(mp);
+        }
         SelectObject(dc,obr); SelectObject(dc,op); DeleteObject(p);
         EndPaint(h,&ps);
         return 0;
@@ -802,8 +1803,15 @@ static LRESULT CALLBACK ScopeWndProc(HWND h,UINT m,WPARAM wp,LPARAM lp)
         if(B) return HTBOTTOM;
         return HTCAPTION;   /* le corps deplace la fenetre */
     }
+    case WM_MOVE:{
+        /* la place est memoriee a chaque deplacement : c'est elle que l'ini
+           retrouvera au prochain lancement, fenetre fermee ou pas */
+        RECT r; if(GetWindowRect(h,&r)){ g_sc[idx].wr=r; g_sc[idx].wrValid=TRUE; }
+        return 0;
+    }
     case WM_SIZE:{
         RECT rc; GetClientRect(h,&rc);
+        RECT r; if(GetWindowRect(h,&r)){ g_sc[idx].wr=r; g_sc[idx].wrValid=TRUE; }
         if(rc.right>2&&rc.bottom>2){
             EnsureScopeBmp(idx,rc.right,rc.bottom);
             RenderScope(idx);
@@ -811,6 +1819,9 @@ static LRESULT CALLBACK ScopeWndProc(HWND h,UINT m,WPARAM wp,LPARAM lp)
         }
         return 0;
     }
+    case WM_EXITSIZEMOVE:
+        SaveSettings();
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT:{
         PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps);
@@ -884,11 +1895,15 @@ static void ApplySplitMode(void)
         BOOL want=(g_split&&s->on);
         if(want&&!s->wnd){
             RECT mr; GetWindowRect(g_hMain,&mr);
-            int w=560,h=340;
-            int x=mr.right+12,y=mr.top+(i-SC_WAVE)*(h+14);
+            int x=mr.right+UI(12),y=mr.top+(i-SC_WAVE)*(UI(340)+UI(14));
+            int cx=UI(560),cy=UI(340);
+            if(s->wrValid){                 /* place et taille gardees dans l'ini */
+                x=s->wr.left; y=s->wr.top;
+                cx=s->wr.right-s->wr.left; cy=s->wr.bottom-s->wr.top;
+            }
             s->wnd=CreateWindowExA(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
                 SCOPEW_CLASS,"",WS_POPUP|WS_THICKFRAME,
-                x,y,w,h,NULL,NULL,g_inst,(LPVOID)(INT_PTR)i);
+                x,y,cx,cy,NULL,NULL,g_inst,(LPVOID)(INT_PTR)i);
             /* force le recalcul du cadre supprime par WM_NCCALCSIZE */
             SetWindowPos(s->wnd,NULL,0,0,0,0,
                 SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOACTIVATE);
@@ -902,11 +1917,12 @@ static void ApplySplitMode(void)
 }
 
 /* ================= preferences ================= */
-static const char *MOD_NAMES[4]={"Alt","Ctrl","Maj (Shift)","Win"};
-static const int   MOD_VKS[4]={VK_MENU,VK_CONTROL,VK_SHIFT,VK_LWIN};
-static const char *PAUSE_NAMES[3]={"Echap","F2","F3"};
-static const int   PAUSE_VKS[3]={VK_ESCAPE,VK_F2,VK_F3};
-static const char *WFMODE_NAMES[2]={"Blanc (luma)","RGB (parade)"};
+static const int MOD_VKS[4]={VK_MENU,VK_CONTROL,VK_SHIFT,VK_LWIN};
+static const int MOD_STR[4]={S_ALT,S_CTRL,S_SHIFT,S_WIN};
+static const int PAUSE_VKS[3]={VK_ESCAPE,VK_F2,VK_F3};
+
+static const wchar_t*PauseLabel(int i)
+{ return (i==0)?Tr(S_ESC):(i==1?L"F2":L"F3"); }
 
 static void ApplySlider(int x)
 {
@@ -917,31 +1933,33 @@ static void ApplySlider(int x)
     RenderAll();
 }
 
-static void RadioAA(DWORD*buf,int W,int H,HDC dc,RECT r,BOOL sel,const char*label)
+static void RadioAA(DWORD*buf,int W,int H,HDC dc,RECT r,BOOL sel,const wchar_t*label)
 {
-    double cx=r.left+9.0,cy=r.top+11.0;
+    double rad=UI(5);
+    double cx=r.left+UI(9),cy=r.top+UI(11);
     if(sel){
-        AARing(buf,W,H,cx,cy,5.0,1.4,120,220,255,1.0);
-        AADisc(buf,W,H,cx,cy,2.6,120,220,255,1.0);
-    } else AARing(buf,W,H,cx,cy,5.0,1.2,125,125,132,1.0);
+        AARing(buf,W,H,cx,cy,rad,1.4,120,220,255,1.0);
+        AADisc(buf,W,H,cx,cy,rad*0.52,120,220,255,1.0);
+    } else AARing(buf,W,H,cx,cy,rad,1.2,125,125,132,1.0);
     SetTextColor(dc,sel?RGB(120,220,255):RGB(215,215,220));
-    TextOutA(dc,r.left+22,r.top+2,label,(int)strlen(label));
+    DrawTxtW(dc,r.left+UI(22),r.top+UI(2),label);
 }
 
-static void CheckAA(DWORD*buf,int W,int H,HDC dc,RECT r,BOOL on,const char*label)
+static void CheckAA(DWORD*buf,int W,int H,HDC dc,RECT r,BOOL on,const wchar_t*label)
 {
-    double cx=r.left+9.0,cy=r.top+10.0;
+    double half=UI(6);
+    double cx=r.left+UI(9),cy=r.top+UI(10);
     if(on){
-        AASquare(buf,W,H,(int)cx,(int)cy,6,40,110,170,1.0);
-        AARing(buf,W,H,cx,cy,7.6,1.0,90,180,255,0.6);
-        AALine(buf,W,H,cx-3.2,cy+0.2,cx-0.8,cy+2.8,1.8,170,230,255,1.0);
-        AALine(buf,W,H,cx-0.8,cy+2.8,cx+3.4,cy-3.0,1.8,170,230,255,1.0);
+        AASquare(buf,W,H,(int)cx,(int)cy,(int)half,40,110,170,1.0);
+        AARing(buf,W,H,cx,cy,half+1.6,1.0,90,180,255,0.6);
+        AALine(buf,W,H,cx-half*0.53,cy+half*0.03,cx-half*0.13,cy+half*0.47,1.8,170,230,255,1.0);
+        AALine(buf,W,H,cx-half*0.13,cy+half*0.47,cx+half*0.57,cy-half*0.50,1.8,170,230,255,1.0);
     } else {
-        AASquare(buf,W,H,(int)cx,(int)cy,6,52,52,58,1.0);
-        AARing(buf,W,H,cx,cy,7.6,1.0,125,125,132,0.9);
+        AASquare(buf,W,H,(int)cx,(int)cy,(int)half,52,52,58,1.0);
+        AARing(buf,W,H,cx,cy,half+1.6,1.0,125,125,132,0.9);
     }
     SetTextColor(dc,RGB(215,215,220));
-    TextOutA(dc,r.left+24,r.top+2,label,(int)strlen(label));
+    DrawTxtW(dc,r.left+UI(24),r.top+UI(2),label);
 }
 
 static BOOL EnsurePopupBuf(HDC ref,int W,int H)
@@ -974,39 +1992,61 @@ static LRESULT CALLBACK PrefsProc(HWND h,UINT m,WPARAM w,LPARAM l)
 {
     switch(m){
     case WM_CREATE:{
-        int y=32;
-        for(int i=0;i<4;i++){ SetRect(&g_modRc[i],14,y,236,y+21); y+=21; }
-        y+=26;
-        for(int i=0;i<3;i++){ SetRect(&g_pauseRc[i],14,y,236,y+21); y+=21; }
-        y+=26;
-        for(int i=0;i<2;i++){ SetRect(&g_wfModeRc[i],14,y,236,y+21); y+=21; }
-        y+=14;
-        SetRect(&g_skinRc,14,y,236,y+21);   y+=23;
-        SetRect(&g_rgbCurRc,14,y,236,y+21); y+=23;
-        SetRect(&g_clipRc,14,y,236,y+21);   y+=40;
-        for(int i=0;i<6;i++) SetRect(&g_swatchRc[i],16+i*35,y,16+i*35+26,y+26);
-        y+=54;
-        SetRect(&g_sliderRc,18,y,228,y+8);
+        int y=UI(32);
+        for(int i=0;i<4;i++){ SetRect(&g_modRc[i],UI(14),y,UI(236),y+UI(21)); y+=UI(21); }
+        y+=UI(26);
+        for(int i=0;i<3;i++){ SetRect(&g_pauseRc[i],UI(14),y,UI(236),y+UI(21)); y+=UI(21); }
+        y+=UI(26);
+        for(int i=0;i<2;i++){ SetRect(&g_wfModeRc[i],UI(14),y,UI(236),y+UI(21)); y+=UI(21); }
+        y+=UI(14);
+        SetRect(&g_skinRc,UI(14),y,UI(236),y+UI(21));   y+=UI(23);
+        SetRect(&g_rgbCurRc,UI(14),y,UI(236),y+UI(21)); y+=UI(23);
+        SetRect(&g_clipRc,UI(14),y,UI(236),y+UI(21));   y+=UI(23);
+        SetRect(&g_barsRc,UI(14),y,UI(236),y+UI(21));  y+=UI(23);
+        SetRect(&g_hdrRc, UI(14),y,UI(236),y+UI(21));  y+=UI(40);
+        for(int i=0;i<6;i++) SetRect(&g_swatchRc[i],UI(16+i*35),y,UI(16+i*35+26),y+UI(26));
+        y+=UI(54);
+        SetRect(&g_sliderRc,UI(18),y,UI(228),y+UI(8));
+        y+=UI(40);
+        for(int i=0;i<2;i++){ SetRect(&g_langRc[i],UI(14),y,UI(236),y+UI(21)); y+=UI(21); }
         return 0;
     }
     case WM_LBUTTONDOWN:{
         POINT p={(short)LOWORD(l),(short)HIWORD(l)};
-        for(int i=0;i<4;i++) if(PtInRect(&g_modRc[i],p)){ g_modVK=MOD_VKS[i]; InvalidateRect(h,NULL,TRUE); return 0; }
-        for(int i=0;i<3;i++) if(PtInRect(&g_pauseRc[i],p)){ g_pauseVK=PAUSE_VKS[i]; InvalidateRect(h,NULL,TRUE); return 0; }
+        for(int i=0;i<4;i++) if(PtInRect(&g_modRc[i],p)){ g_modVK=MOD_VKS[i]; SaveSettings(); InvalidateRect(h,NULL,TRUE); return 0; }
+        for(int i=0;i<3;i++) if(PtInRect(&g_pauseRc[i],p)){ g_pauseVK=PAUSE_VKS[i]; SaveSettings(); InvalidateRect(h,NULL,TRUE); return 0; }
         for(int i=0;i<2;i++) if(PtInRect(&g_wfModeRc[i],p)){
             g_wfRGB=(i==1);
             RebuildTemplate(SC_WAVE); RenderAll();
+            SaveSettings();
             InvalidateRect(h,NULL,TRUE); return 0;
         }
-        if(PtInRect(&g_skinRc,p)){ g_showSkin=!g_showSkin; RebuildTemplate(SC_VEC); RenderAll(); InvalidateRect(h,NULL,TRUE); return 0; }
-        if(PtInRect(&g_rgbCurRc,p)){ g_rgbAtCursor=!g_rgbAtCursor; InvalidateRect(g_hMain,NULL,FALSE); InvalidateRect(h,NULL,TRUE); return 0; }
-        if(PtInRect(&g_clipRc,p)){ g_clipping=!g_clipping; RenderAll(); InvalidateRect(h,NULL,TRUE); return 0; }
+        if(PtInRect(&g_skinRc,p)){ g_showSkin=!g_showSkin; RebuildTemplate(SC_VEC); RenderAll(); SaveSettings(); InvalidateRect(h,NULL,TRUE); return 0; }
+        if(PtInRect(&g_rgbCurRc,p)){ g_rgbAtCursor=!g_rgbAtCursor; InvalidateRect(g_hMain,NULL,FALSE); SaveSettings(); InvalidateRect(h,NULL,TRUE); return 0; }
+        if(PtInRect(&g_clipRc,p)){ g_clipping=!g_clipping; RenderAll(); SaveSettings(); InvalidateRect(h,NULL,TRUE); return 0; }
+        if(PtInRect(&g_barsRc,p)){
+            g_ignoreBars=!g_ignoreBars;
+            if(g_hasSelection&&!g_paused) Capture(g_selRectScreen,TRUE);
+            SaveSettings();
+            InvalidateRect(h,NULL,TRUE); return 0;
+        }
+        if(PtInRect(&g_hdrRc,p)){
+            g_hdrNorm=!g_hdrNorm;
+            if(g_hasSelection&&!g_paused) Capture(g_selRectScreen,TRUE);
+            SaveSettings();
+            InvalidateRect(h,NULL,TRUE); return 0;
+        }
         for(int i=0;i<6;i++) if(PtInRect(&g_swatchRc[i],p)){
             g_frameColor=g_swatch[i];
             if(g_hOverlay) InvalidateRect(g_hOverlay,NULL,FALSE);
+            SaveSettings();
             InvalidateRect(h,NULL,TRUE); return 0;
         }
-        RECT hit=g_sliderRc; InflateRect(&hit,8,10);
+        for(int i=0;i<2;i++) if(PtInRect(&g_langRc[i],p)){
+            if(g_lang!=i){ g_lang=i; ApplyLanguage(); }
+            return 0;
+        }
+        RECT hit=g_sliderRc; InflateRect(&hit,UI(8),UI(10));
         if(PtInRect(&hit,p)){ g_sliderDrag=TRUE; SetCapture(h); ApplySlider(p.x); InvalidateRect(h,NULL,TRUE); }
         return 0;
     }
@@ -1014,7 +2054,7 @@ static LRESULT CALLBACK PrefsProc(HWND h,UINT m,WPARAM w,LPARAM l)
         if(g_sliderDrag){ ApplySlider((short)LOWORD(l)); InvalidateRect(h,NULL,TRUE); }
         return 0;
     case WM_LBUTTONUP:
-        if(g_sliderDrag){ g_sliderDrag=FALSE; ReleaseCapture(); }
+        if(g_sliderDrag){ g_sliderDrag=FALSE; ReleaseCapture(); SaveSettings(); }
         return 0;
     case WM_ACTIVATE:
         if(LOWORD(w)==WA_INACTIVE&&!g_sliderDrag) DestroyWindow(h);
@@ -1030,29 +2070,32 @@ static LRESULT CALLBACK PrefsProc(HWND h,UINT m,WPARAM w,LPARAM l)
 
         SelectObject(g_pfDC,g_hFontBold);
         SetTextColor(g_pfDC,RGB(145,145,152));
-        TextOutA(g_pfDC,14,10,"Selection (maintenir + clic-glisser)",36);
+        DrawTxtW(g_pfDC,UI(14),UI(10),Tr(S_HSEL));
         SelectObject(g_pfDC,g_hFont);
-        for(int i=0;i<4;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_modRc[i],g_modVK==MOD_VKS[i],MOD_NAMES[i]);
+        for(int i=0;i<4;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_modRc[i],g_modVK==MOD_VKS[i],Tr(MOD_STR[i]));
 
         SelectObject(g_pfDC,g_hFontBold);
         SetTextColor(g_pfDC,RGB(145,145,152));
-        TextOutA(g_pfDC,14,g_pauseRc[0].top-19,"Touche pause / reprise",21);
+        DrawTxtW(g_pfDC,UI(14),g_pauseRc[0].top-UI(19),Tr(S_HPAUSE));
         SelectObject(g_pfDC,g_hFont);
-        for(int i=0;i<3;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_pauseRc[i],g_pauseVK==PAUSE_VKS[i],PAUSE_NAMES[i]);
+        for(int i=0;i<3;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_pauseRc[i],g_pauseVK==PAUSE_VKS[i],PauseLabel(i));
 
         SelectObject(g_pfDC,g_hFontBold);
         SetTextColor(g_pfDC,RGB(145,145,152));
-        TextOutA(g_pfDC,14,g_wfModeRc[0].top-19,"Mode waveform",13);
+        DrawTxtW(g_pfDC,UI(14),g_wfModeRc[0].top-UI(19),Tr(S_HWAVE));
         SelectObject(g_pfDC,g_hFont);
-        for(int i=0;i<2;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_wfModeRc[i],(g_wfRGB?1:0)==i,WFMODE_NAMES[i]);
+        for(int i=0;i<2;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_wfModeRc[i],(g_wfRGB?1:0)==i,
+                                     Tr(i==0?S_LUMA:S_PARADEM));
 
-        CheckAA(g_pfBits,W,H,g_pfDC,g_skinRc,g_showSkin,"Afficher la ligne des tons chair");
-        CheckAA(g_pfBits,W,H,g_pfDC,g_rgbCurRc,g_rgbAtCursor,"RGB at cursor");
-        CheckAA(g_pfBits,W,H,g_pfDC,g_clipRc,g_clipping,"Clipping");
+        CheckAA(g_pfBits,W,H,g_pfDC,g_skinRc,  g_showSkin,   Tr(S_CKSKIN));
+        CheckAA(g_pfBits,W,H,g_pfDC,g_rgbCurRc,g_rgbAtCursor,Tr(S_CKRGB));
+        CheckAA(g_pfBits,W,H,g_pfDC,g_clipRc,  g_clipping,   Tr(S_CKCLIP));
+        CheckAA(g_pfBits,W,H,g_pfDC,g_barsRc,  g_ignoreBars, Tr(S_CKBARS));
+        CheckAA(g_pfBits,W,H,g_pfDC,g_hdrRc,   g_hdrNorm,    Tr(S_CKHDR));
 
         SelectObject(g_pfDC,g_hFontBold);
         SetTextColor(g_pfDC,RGB(145,145,152));
-        TextOutA(g_pfDC,14,g_swatchRc[0].top-19,"Couleur du cadre",16);
+        DrawTxtW(g_pfDC,UI(14),g_swatchRc[0].top-UI(19),Tr(S_HCOLOR));
         SelectObject(g_pfDC,g_hFont);
         for(int i=0;i<6;i++){
             RECT s=g_swatchRc[i];
@@ -1066,8 +2109,8 @@ static LRESULT CALLBACK PrefsProc(HWND h,UINT m,WPARAM w,LPARAM l)
 
         SelectObject(g_pfDC,g_hFontBold);
         SetTextColor(g_pfDC,RGB(145,145,152));
-        { char t[64]; snprintf(t,sizeof(t),"Luminosite du nuage : %.2fx",g_brightness);
-          TextOutA(g_pfDC,14,g_sliderRc.top-23,t,(int)strlen(t)); }
+        { wchar_t t[64]; swprintf(t,64,Tr(S_HBRIGHT),g_brightness);
+          DrawTxtW(g_pfDC,UI(14),g_sliderRc.top-UI(23),t); }
         SelectObject(g_pfDC,g_hFont);
         {
             double ty=(g_sliderRc.top+g_sliderRc.bottom)/2.0;
@@ -1079,6 +2122,13 @@ static LRESULT CALLBACK PrefsProc(HWND h,UINT m,WPARAM w,LPARAM l)
             AADisc(g_pfBits,W,H,kx,ty,7.5,235,235,240,1.0);
             AARing(g_pfBits,W,H,kx,ty,7.5,1.2,150,150,158,0.8);
         }
+
+        SelectObject(g_pfDC,g_hFontBold);
+        SetTextColor(g_pfDC,RGB(145,145,152));
+        DrawTxtW(g_pfDC,UI(14),g_langRc[0].top-UI(19),Tr(S_HLANG));
+        SelectObject(g_pfDC,g_hFont);
+        for(int i=0;i<2;i++) RadioAA(g_pfBits,W,H,g_pfDC,g_langRc[i],g_lang==i,
+                                     Tr(i==0?S_EN_LBL:S_ZH_LBL));
 
         BitBlt(dc,0,0,W,H,g_pfDC,0,0,SRCCOPY);
         EndPaint(h,&ps);
@@ -1097,12 +2147,12 @@ static LRESULT CALLBACK ScopesProc(HWND h,UINT m,WPARAM w,LPARAM l)
 {
     switch(m){
     case WM_CREATE:{
-        int y=14;
+        int y=UI(14);
         for(int i=SC_WAVE;i<SC_COUNT;i++){
-            SetRect(&g_scChkRc[i],14,y,206,y+21);
-            y+=23;
+            SetRect(&g_scChkRc[i],UI(14),y,UI(206),y+UI(21));
+            y+=UI(23);
         }
-        SetRect(&g_scSplitRc,14,y+12,206,y+33);
+        SetRect(&g_scSplitRc,UI(14),y+UI(12),UI(206),y+UI(33));
         return 0;
     }
     case WM_LBUTTONDOWN:{
@@ -1116,6 +2166,7 @@ static LRESULT CALLBACK ScopesProc(HWND h,UINT m,WPARAM w,LPARAM l)
             ApplySplitMode();
             FitWindowToContent(g_hMain);
             RecomputeLayout(g_hMain);
+            SaveSettings();
             InvalidateRect(h,NULL,TRUE);
         }
         return 0;
@@ -1134,11 +2185,11 @@ static LRESULT CALLBACK ScopesProc(HWND h,UINT m,WPARAM w,LPARAM l)
         SelectObject(g_pfDC,g_hFont);
 
         for(int i=SC_WAVE;i<SC_COUNT;i++)
-            CheckAA(g_pfBits,W,H,g_pfDC,g_scChkRc[i],g_sc[i].on,SC_NAME[i]);
+            CheckAA(g_pfBits,W,H,g_pfDC,g_scChkRc[i],g_sc[i].on,Tr(SC_STR[i]));
 
-        int sy=g_scSplitRc.top-7;
-        AALine(g_pfBits,W,H,12,sy,W-12,sy,1.0,90,90,96,0.6);
-        CheckAA(g_pfBits,W,H,g_pfDC,g_scSplitRc,g_split,"Split scopes");
+        int sy=g_scSplitRc.top-UI(7);
+        AALine(g_pfBits,W,H,UI(12),sy,W-UI(12),sy,1.0,90,90,96,0.6);
+        CheckAA(g_pfBits,W,H,g_pfDC,g_scSplitRc,g_split,Tr(S_SPLIT));
 
         BitBlt(dc,0,0,W,H,g_pfDC,0,0,SRCCOPY);
         EndPaint(h,&ps);
@@ -1164,15 +2215,15 @@ static void OpenPopup(HWND owner,const char*cls,HWND*slot,int mi,int w,int h)
 }
 
 /* ================= barre de menu ================= */
-static void MenuLabel(int i,char*out,int n)
+static const wchar_t*MenuLabel(int i)
 {
     switch(i){
-    case MI_ONOFF: snprintf(out,n,"%s",(g_hasSelection&&!g_paused)?"ON":"OFF"); break;
-    case MI_SCOPES:snprintf(out,n,"Scopes"); break;
-    case MI_PREFS: snprintf(out,n,"Preferences"); break;
-    case MI_RESET: snprintf(out,n,"Reset"); break;
-    default: out[0]=0;
+    case MI_ONOFF: return (g_hasSelection&&!g_paused)?Tr(S_ON):Tr(S_OFF);
+    case MI_SCOPES:return Tr(S_SCOPES);
+    case MI_PREFS: return Tr(S_PREFS);
+    case MI_RESET: return Tr(S_RESET);
     }
+    return L"";
 }
 
 static void DrawTopBar(HDC dc,RECT client)
@@ -1205,8 +2256,7 @@ static void DrawTopBar(HDC dc,RECT client)
             DeleteObject(hb);
         }
         SetTextColor(dc,txt);
-        char lbl[32]; MenuLabel(i,lbl,sizeof(lbl));
-        DrawTextA(dc,lbl,-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        DrawTextW(dc,MenuLabel(i),-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
     if(of) SelectObject(dc,of);
 }
@@ -1241,7 +2291,7 @@ static void FitWindowToContent(HWND hwnd)
     int rows=(n+1)/2;
     int cols=(n>1)?2:1;
 
-    int cell=380;   /* taille de reference d'une cellule */
+    int cell=UI(380);   /* taille de reference d'une cellule */
     int contentW=cols*cell+(cols-1)*SPLIT_W;
     int contentH=rows*cell+(rows-1)*SPLIT_W;
 
@@ -1254,16 +2304,37 @@ static void RecomputeLayout(HWND hwnd)
 {
     RECT rc; GetClientRect(hwnd,&rc);
 
-    int x=8;
-    int widths[MI_COUNT]={56,74,98,60};
+    /* largeur de chaque item MESUREE dans la police courante : un libelle
+       chinois et un libelle anglais n'ont pas du tout la meme taille, et une
+       largeur figee rognerait l'un ou l'autre. ON/OFF est le libelle qui change
+       d'etat : on retient la plus large des deux chaines pour que la barre ne
+       bouge pas quand on bascule la suivi. */
+    int widths[MI_COUNT];
+    {
+        HDC dc=GetDC(hwnd);
+        HGDIOBJ of=SelectObject(dc,g_hFont);
+        for(int i=0;i<MI_COUNT;i++){
+            int w=0;
+            if(i==MI_ONOFF){
+                int a=WideW(dc,Tr(S_ON)),b=WideW(dc,Tr(S_OFF));
+                w=(a>b)?a:b;
+            } else w=WideW(dc,MenuLabel(i));
+            widths[i]=w+UI(20);
+            if(widths[i]<UI(40)) widths[i]=UI(40);
+        }
+        if(of) SelectObject(dc,of);
+        ReleaseDC(hwnd,dc);
+    }
+
+    int x=UI(8);
     for(int i=0;i<MI_COUNT-1;i++){
         g_miRect[i].left=x; g_miRect[i].right=x+widths[i];
-        g_miRect[i].top=4;  g_miRect[i].bottom=MENUBAR_H-5;
-        x+=widths[i]+6;
+        g_miRect[i].top=UI(4);  g_miRect[i].bottom=MENUBAR_H-UI(5);
+        x+=widths[i]+UI(6);
     }
-    g_miRect[MI_RESET].right=rc.right-8;
+    g_miRect[MI_RESET].right=rc.right-UI(8);
     g_miRect[MI_RESET].left=g_miRect[MI_RESET].right-widths[MI_RESET];
-    g_miRect[MI_RESET].top=4;
+    g_miRect[MI_RESET].top=UI(4);
     g_miRect[MI_RESET].bottom=MENUBAR_H-5;
 
     int contentX=MARGIN;
@@ -1301,7 +2372,7 @@ static void RecomputeLayout(HWND hwnd)
             int idx=list[i0+c];
             int colW=(c==cnt-1)?(contentX+contentW-cx)
                                :(int)(usable*pa/sum);
-            if(colW<80) colW=80;
+            if(colW<UI(80)) colW=UI(80);
 
             if(idx==SC_VEC){
                 int size=(colW<rowH)?colW:rowH;
@@ -1328,7 +2399,14 @@ static void RecomputeLayout(HWND hwnd)
 
     {
         RECT v=g_sc[SC_VEC].rc;
-        SetRect(&g_zoomChkRc,v.left+8,v.bottom-26,v.left+96,v.bottom-6);
+        HDC dc=GetDC(hwnd);
+        HGDIOBJ of=SelectObject(dc,g_hFont);
+        int tw=WideW(dc,Tr(S_ZOOM2));
+        if(of) SelectObject(dc,of);
+        ReleaseDC(hwnd,dc);
+        int bw=UI(20)+tw+UI(6);       /* boite + espace + libelle mesure */
+        SetRect(&g_zoomChkRc,v.left+UI(8),v.bottom-UI(26),
+                           v.left+UI(8)+bw,v.bottom-UI(6));
     }
 
     RenderAll();
@@ -1351,24 +2429,85 @@ static void ApplyDarkTitleBar(HWND hwnd)
     DwmSetWindowAttribute(hwnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
 }
 
+/* ================= polices et langue =================
+   GDI ne substitue pas une famille pour une autre : rendre du chinois avec
+   "Segoe UI" produit des cadres vides la ou le glyphes manque. On a donc une
+   famille explicite par langue, verifiee dans le registre des polices de
+   l'installation avant d'etre adoptee (repli en cascade). */
+static BOOL g_fontFound=FALSE;
+static int CALLBACK FontExistProc(const ENUMLOGFONTEXW*elf,const NEWTEXTMETRICEXW*nm,DWORD ft,LPCWSTR want)
+{
+    (void)nm; (void)ft;
+    if(_wcsicmp(elf->elfLogFont.lfFaceName,want)==0){
+        g_fontFound=TRUE; return FALSE;
+    }
+    return TRUE;
+}
+static BOOL FontExists(const wchar_t*face)
+{
+    HDC dc=GetDC(NULL);
+    if(!dc) return TRUE;
+    LOGFONTW lf; memset(&lf,0,sizeof(lf));
+    lf.lfCharSet=DEFAULT_CHARSET;
+    lstrcpyW(lf.lfFaceName,face);
+    g_fontFound=FALSE;
+    EnumFontFamiliesExW(dc,&lf,(FONTENUMPROCW)FontExistProc,(LPARAM)face,0);
+    ReleaseDC(NULL,dc);
+    return g_fontFound;
+}
+
+static void CreateFonts(void)
+{
+    const wchar_t*face=L"Segoe UI";
+    if(g_lang==L_ZH){
+        static const wchar_t*cjk[]={L"Microsoft YaHei UI",L"Microsoft YaHei",
+                                    L"SimHei",L"SimSun",L"NSimSun"};
+        for(int i=0;i<(int)(sizeof(cjk)/sizeof(cjk[0]));i++)
+            if(FontExists(cjk[i])){ face=cjk[i]; break; }
+    }
+    g_hFont=CreateFontW(UI(13),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH|FF_SWISS,face);
+    g_hFontBold=CreateFontW(UI(12),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH|FF_SWISS,face);
+}
+static void DestroyFonts(void)
+{
+    if(g_hFont){ DeleteObject(g_hFont); g_hFont=NULL; }
+    if(g_hFontBold){ DeleteObject(g_hFontBold); g_hFontBold=NULL; }
+}
+
+/* Changer de langue retracte tout ce qui depend du texte : la police, les
+   gabarits (les libelles sont GRAVES dans le bitmap de chaque scope) et la
+   mise en page (les largeurs sont mesurees). */
+static void ApplyLanguage(void)
+{
+    DestroyFonts();
+    CreateFonts();
+    RefreshStatus();                             /* le statut est fige, lui */
+    for(int i=0;i<SC_COUNT;i++) RebuildTemplate(i);
+    if(g_hMain) RecomputeLayout(g_hMain);   /* rend et repeint la principale */
+    if(g_hOverlay) InvalidateRect(g_hOverlay,NULL,FALSE);
+    if(g_hPrefs)  InvalidateRect(g_hPrefs,NULL,TRUE);
+    if(g_hScopes) InvalidateRect(g_hScopes,NULL,TRUE);
+    for(int i=SC_WAVE;i<SC_COUNT;i++)
+        if(g_sc[i].wnd) InvalidateRect(g_sc[i].wnd,NULL,FALSE);
+    SaveSettings();
+}
+
 static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
 {
     switch(m){
     case WM_CREATE:{
-        g_hFont=CreateFontA(13,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-            DEFAULT_PITCH|FF_SWISS,"Segoe UI");
-        g_hFontBold=CreateFontA(12,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-            DEFAULT_PITCH|FF_SWISS,"Segoe UI");
+        CreateFonts();
 
         ApplyDarkTitleBar(hwnd);
 
-        for(int i=0;i<SC_COUNT;i++){
-            g_sc[i].dc=CreateCompatibleDC(NULL);
-            g_sc[i].prop=1.0;
-        }
+        for(int i=0;i<SC_COUNT;i++) g_sc[i].dc=CreateCompatibleDC(NULL);
         g_sc[SC_VEC].on=TRUE;
+        /* les proportions et les options viennent de LoadSettings (ini) : ici,
+           on ne touche que ce qui depend de la fenetre en cours de creation */
         RecomputeLayout(hwnd);
 
         int ox=GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -1389,14 +2528,26 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
     case WM_SETTINGCHANGE:
         ApplyDarkTitleBar(hwnd);
         return 0;
+    case WM_DISPLAYCHANGE:
+        /* basculer HDR/SDR ou brancher un ecran : tout est a re-apprendre */
+        g_hdrTick=0;
+        WgcClose(); g_wTried=0; g_sdrWhite=0.0; g_calTick=0;
+        if(g_hasSelection&&!g_paused) Capture(g_selRectScreen,TRUE);
+        return 0;
     case WM_GETMINMAXINFO:{
         MINMAXINFO*mi=(MINMAXINFO*)lp;
-        mi->ptMinTrackSize.x=MIN_CANVAS+2*MARGIN+20;
-        mi->ptMinTrackSize.y=MIN_CANVAS+2*MARGIN+MENUBAR_H+STATUS_H+40;
+        mi->ptMinTrackSize.x=MIN_CANVAS+2*MARGIN+UI(20);
+        mi->ptMinTrackSize.y=MIN_CANVAS+2*MARGIN+MENUBAR_H+STATUS_H+UI(40);
         return 0;
     }
     case WM_SIZE:
         if(g_sc[SC_VEC].dc) RecomputeLayout(hwnd);
+        return 0;
+    case WM_MOVE:
+        if(!IsIconic(hwnd)){
+            RECT r;
+            if(GetWindowRect(hwnd,&r)){ g_mainRect=r; g_mainRectValid=TRUE; }
+        }
         return 0;
     case WM_SETCURSOR:{
         POINT p; GetCursorPos(&p); ScreenToClient(hwnd,&p);
@@ -1424,6 +2575,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
         if(PtInRect(&g_zoomChkRc,p)){
             g_zoom2=!g_zoom2;
             RenderVec();
+            SaveSettings();
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }
@@ -1431,8 +2583,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
         int i=MenuHit(p);
         if(i==MI_ONOFF){ if(g_hasSelection) SetTracking(g_paused); }
         else if(i==MI_RESET){ if(g_hasSelection) ResetZone(); }
-        else if(i==MI_SCOPES){ OpenPopup(hwnd,SCOPES_CLASS,&g_hScopes,MI_SCOPES,220,140); InvalidateRect(hwnd,NULL,FALSE); }
-        else if(i==MI_PREFS){ OpenPopup(hwnd,PREFS_CLASS,&g_hPrefs,MI_PREFS,252,456); InvalidateRect(hwnd,NULL,FALSE); }
+        else if(i==MI_SCOPES){ OpenPopup(hwnd,SCOPES_CLASS,&g_hScopes,MI_SCOPES,UI(220),UI(140)); InvalidateRect(hwnd,NULL,FALSE); }
+        else if(i==MI_PREFS){ OpenPopup(hwnd,PREFS_CLASS,&g_hPrefs,MI_PREFS,UI(252),UI(583)); InvalidateRect(hwnd,NULL,FALSE); }
         return 0;
     }
     case WM_MOUSEMOVE:{
@@ -1465,7 +2617,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
         return 0;
     }
     case WM_LBUTTONUP:
-        if(g_splitDragRow>=0){ g_splitDragRow=-1; ReleaseCapture(); }
+        if(g_splitDragRow>=0){ g_splitDragRow=-1; ReleaseCapture(); SaveSettings(); }
+        return 0;
+    case WM_EXITSIZEMOVE:
+        /* deplace ou redimensionne a la souris : la place merite d'etre garde */
+        SaveSettings();
         return 0;
     case WM_MOUSELEAVE:
         g_tracking=FALSE;
@@ -1490,7 +2646,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
                 if(nr!=g_curR||ng!=g_curG||nb!=g_curB){
                     g_curR=nr; g_curG=ng; g_curB=nb;
                     RECT v=g_sc[SC_VEC].rc;
-                    RECT ir={v.left,v.bottom-26,v.right,v.bottom};
+                    RECT ir={v.left,v.bottom-UI(26),v.right,v.bottom};
                     InvalidateRect(hwnd,&ir,FALSE);
                 }
             }
@@ -1540,7 +2696,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
                 else {
                     ShowWindow(g_hOverlay,SW_HIDE);
                     g_hasSelection=FALSE;
-                    snprintf(g_status,sizeof(g_status),"Selection trop petite - reessayez.");
+                    SetStatusMsg(S_TOOSMALL);
                     InvalidateRect(hwnd,NULL,FALSE);
                 }
                 g_refreshCounter=0;
@@ -1582,37 +2738,41 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
 
         {
             RECT z=g_zoomChkRc;
-            int bx=z.left+2,by=z.top+3;
+            int bs=UI(14),q=bs/14; if(q<1)q=1;
+            int cy0=(z.top+z.bottom)/2;
+            TEXTMETRICW tm;
+            { HGDIOBJ o=SelectObject(dc,g_hFont); GetTextMetricsW(dc,&tm); SelectObject(dc,o); }
+            int bx=z.left+UI(2),by=cy0-bs/2;
             HPEN p=CreatePen(PS_SOLID,1,g_zoom2?RGB(90,180,255):RGB(120,120,126));
             HBRUSH b=CreateSolidBrush(g_zoom2?RGB(40,110,170):RGB(46,46,52));
             HGDIOBJ op=SelectObject(dc,p),obb=SelectObject(dc,b);
-            RoundRect(dc,bx,by,bx+14,by+14,3,3);
+            RoundRect(dc,bx,by,bx+bs,by+bs,UI(3),UI(3));
             SelectObject(dc,obb); SelectObject(dc,op);
             DeleteObject(b); DeleteObject(p);
             if(g_zoom2){
                 HPEN cp=CreatePen(PS_SOLID,2,RGB(170,230,255));
                 HGDIOBJ ocp=SelectObject(dc,cp);
-                MoveToEx(dc,bx+3,by+7,NULL);
-                LineTo(dc,bx+6,by+10);
-                LineTo(dc,bx+11,by+4);
+                MoveToEx(dc,bx+3*q,by+7*q,NULL);
+                LineTo(dc,bx+6*q,by+10*q);
+                LineTo(dc,bx+11*q,by+4*q);
                 SelectObject(dc,ocp); DeleteObject(cp);
             }
             SetTextColor(dc,g_zoomHover?RGB(230,230,235):RGB(150,150,158));
-            TextOutA(dc,bx+20,z.top+1,"Zoom x2",7);
+            DrawTxtW(dc,bx+bs+UI(6),cy0-tm.tmHeight/2,Tr(S_ZOOM2));
         }
 
         if(g_rgbAtCursor){
-            char t[48];
-            snprintf(t,sizeof(t),"R:%d, G:%d, B:%d",g_curR,g_curG,g_curB);
+            wchar_t t[48];
+            swprintf(t,48,Tr(S_RGBAT),g_curR,g_curG,g_curB);
             SetTextColor(dc,RGB(135,135,142));
             RECT v=g_sc[SC_VEC].rc;
-            RECT tr={v.left,v.bottom-24,v.right-8,v.bottom-4};
-            DrawTextA(dc,t,-1,&tr,DT_RIGHT|DT_SINGLELINE);
+            RECT tr={v.left,v.bottom-UI(24),v.right-UI(8),v.bottom-UI(4)};
+            DrawTextW(dc,t,-1,&tr,DT_RIGHT|DT_SINGLELINE);
         }
 
         SetTextColor(dc,RGB(148,148,155));
         RECT sr={MARGIN,rc.bottom-STATUS_H,rc.right-MARGIN,rc.bottom};
-        DrawTextA(dc,g_status,-1,&sr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+        DrawTextW(dc,g_status,-1,&sr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         if(of) SelectObject(dc,of);
 
         EndPaint(hwnd,&ps);
@@ -1620,18 +2780,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
     }
     case WM_DESTROY:
         KillTimer(hwnd,1);
+        SaveSettings();   /* derniere place et derniers reglages de la session */
+        g_hMain=NULL;
         for(int i=0;i<SC_COUNT;i++){
             if(g_sc[i].wnd){ HWND w=g_sc[i].wnd; g_sc[i].wnd=NULL; DestroyWindow(w); }
             FreeScopeBmp(i);
             if(g_sc[i].dc) DeleteDC(g_sc[i].dc);
+            g_sc[i].dc=NULL;
         }
         if(g_pfBmp) DeleteObject(g_pfBmp);
         if(g_pfDC) DeleteDC(g_pfDC);
         if(g_capDC){ DeleteDC(g_capDC); g_capDC=NULL; }
         if(g_capBmp){ DeleteObject(g_capBmp); g_capBmp=NULL; }
-        if(g_hFont) DeleteObject(g_hFont);
-        if(g_hFontBold) DeleteObject(g_hFontBold);
-        if(g_hOverlay) DestroyWindow(g_hOverlay);
+        DestroyFonts();
+        if(g_hOverlay){ DestroyWindow(g_hOverlay); g_hOverlay=NULL; }
         free(g_sR); free(g_sG); free(g_sB); free(g_sCol);
         PostQuitMessage(0);
         return 0;
@@ -1642,7 +2804,37 @@ static LRESULT CALLBACK MainProc(HWND hwnd,UINT m,WPARAM wp,LPARAM lp)
 int WINAPI WinMain(HINSTANCE hi,HINSTANCE hp,LPSTR cl,int ns)
 {
     (void)hp; (void)cl;
+
+    /* A faire AVANT la premiere fenetre et le premier DC.
+       Un process "DPI unaware" est virtualise par Windows : il croit son ecran
+       plus petit (2560 x 1440 pour une dalle 4K a 150 %) et le DWM agrandit ses
+       fenetres d'autant. Mais BitBlt sur le DC d'ecran, lui, recopie les pixels
+       PHYSIQUES aux memes coordonnees (verifie : a zero pres sur toute la
+       surface). Le cadre de l'overlay et la zone capturee ne designent alors
+       plus la meme region de l'ecran : les scopes statistiquent a cote de la
+       zone encadree, et tout repere base sur la capture tombe de traviole.
+       Un process "aware" met les deux dans le meme espace, pixel pour pixel. */
+    {
+        HMODULE u=GetModuleHandleA("user32.dll");
+        BOOL (WINAPI *setctx)(HANDLE)=u?(BOOL (WINAPI *)(HANDLE))
+            GetProcAddress(u,"SetProcessDpiAwarenessContext"):NULL;
+        if(!setctx || !setctx((HANDLE)-4))   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+            SetProcessDPIAware();            /* repli : Windows anterieur a 1703 */
+    }
+    {
+        HDC scr=GetDC(NULL);
+        int dpi=GetDeviceCaps(scr,LOGPIXELSX);
+        ReleaseDC(NULL,scr);
+        if(dpi<96) dpi=96;
+        g_uiScale=(int)((double)dpi*100.0/96.0+0.5);
+    }
+
     g_inst=hi;
+    /* l'ini se lit APRES l'echelle DPI (les tailles par defaut en dependent) et
+       AVANT la moindre fenetre : c'est lui qui decide de la langue, des scopes
+       allumes, des proportions et de la place de chaque fenetre. */
+    LoadSettings();
+    SetStatusMsg(S_HINT);
     g_icon=LoadIconA(hi,MAKEINTRESOURCEA(1));
     HBRUSH darkBrush=CreateSolidBrush(UI_BG);
 
@@ -1684,11 +2876,17 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE hp,LPSTR cl,int ns)
     wsw.hbrBackground=darkBrush;
     RegisterClassA(&wsw);
 
-    int w=380+2*MARGIN+16;
-    int h=380+2*MARGIN+MENUBAR_H+STATUS_H+40;
+    int w=UI(380)+2*MARGIN+UI(16);
+    int h=UI(380)+2*MARGIN+MENUBAR_H+STATUS_H+UI(40);
+    int x=CW_USEDEFAULT,y=CW_USEDEFAULT;
+    if(g_mainRectValid){
+        x=g_mainRect.left;  y=g_mainRect.top;
+        w=g_mainRect.right-g_mainRect.left;
+        h=g_mainRect.bottom-g_mainRect.top;
+    }
 
     g_hMain=CreateWindowExA(WS_EX_TOPMOST,MAIN_CLASS,"ScopeWalker",
-        WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,w,h,
+        WS_OVERLAPPEDWINDOW,x,y,w,h,
         NULL,NULL,hi,NULL);
 
     if(g_icon){
@@ -1698,11 +2896,13 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE hp,LPSTR cl,int ns)
 
     ShowWindow(g_hMain,ns);
     UpdateWindow(g_hMain);
+    if(g_split) ApplySplitMode();   /* les fenetres detachees reviennent aussi */
 
     MSG msg;
     while(GetMessage(&msg,NULL,0,0)){
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    WgcClose();
     return (int)msg.wParam;
 }
